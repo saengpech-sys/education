@@ -1,0 +1,118 @@
+system:
+  name: "Antigravity-Alpha-LowVol-MT5"
+  version: "1.0.0"
+  environment: "production"
+  symbol: "XAUUSD"
+  poll_interval_seconds: 5.0
+  random_seed: 42
+
+symbol_spec:
+  symbol: "XAUUSD"
+  digits: 2
+  point: 0.01
+  tick_size: 0.01
+  tick_value: 1.00          # $1.00 per 0.01 tick move for 1.00 standard lot (100 oz)
+  contract_size: 100.0
+  volume_min: 0.01
+  volume_max: 100.0
+  volume_step: 0.01
+
+data_pipeline:
+  base_timeframe: "M5"
+  higher_timeframes:
+    - "M15"
+    - "H1"
+    - "H4"
+  history_bars_per_tf: 3000
+  atr_period: 14
+  parkinson_window: 20
+  zscore_window: 48
+  hurst_window: 96
+  volume_profile_window: 96
+  volume_profile_bins: 24
+  value_area_pct: 0.70
+  annualization_bars_m5: 72576   # 252 trading days * 288 M5 bars/day
+
+regime_ai:
+  onnx_dir: "artifacts/onnx_models"
+  primary_onnx_filename: "primary_directional.onnx"
+  meta_onnx_filename: "secondary_meta_confidence.onnx"
+  # Market Regime Detection thresholds (First Principle #1)
+  hurst_trending_min: 0.55
+  hurst_mean_reverting_max: 0.45
+  abnormal_vol_zscore_ceiling: 2.50
+  abnormal_vol_ratio_ceiling: 2.20
+  min_directional_efficiency: 0.18
+  # Meta-Labeling & Triple-Barrier settings (Marcos Lopez de Prado)
+  meta_confidence_threshold: 0.62
+  triple_barrier_pt_atr: 2.20
+  triple_barrier_sl_atr: 1.10
+  triple_barrier_max_bars: 24
+  # LightGBM hyperparameters
+  n_estimators: 120
+  learning_rate: 0.04
+  max_depth: 4
+  num_leaves: 15
+  min_child_samples: 25
+  subsample: 0.85
+  colsample_bytree: 0.85
+
+risk_and_scaling:
+  # Dynamic Fractional Kelly & Volatility Targeting (First Principle #2: Zero Martingale)
+  min_risk_per_trade_pct: 0.0025       # 0.25% floor when trade passes meta-filter
+  max_risk_per_trade_pct: 0.0050       # 0.50% hard cap per trade (strictly no Martingale)
+  kelly_fraction: 0.25                 # Quarter-Kelly conservative compounding
+  target_annual_volatility: 0.06       # 6.0% annualized portfolio vol target
+  atr_stop_multiplier: 1.50
+  atr_tp_multiplier: 3.30              # 2.2R asymmetric reward-to-risk
+  spread_risk_weight: 1.25             # Penalizes wide spreads in position sizing denominator
+  # Equity Curve Control & Hard Drawdown Circuit Breaker
+  daily_drawdown_limit_pct: 0.015      # 1.5% Daily Drawdown -> Cooldown Halt
+  max_trailing_drawdown_limit_pct: 0.040  # 4.0% Max Trailing Drawdown -> Cooldown Halt
+  hard_lock_drawdown_limit_pct: 0.060  # 6.0% Emergency Hard Lock
+  cooldown_minutes: 240                # Minimum halt duration before entering 0.5x recovery
+  recovery_lot_multiplier: 0.50        # Half lot size during post-cooldown probation
+  recovery_vol_zscore_max: 1.00        # Market vol z-score required to exit cooldown/probation
+  recovery_drawdown_buffer_pct: 0.008  # Equity recovery buffer to restore 1.0x sizing
+  # Liquidity-Aware Scaling (TWAP / Iceberg)
+  max_lot_per_order: 5.00              # Maximum child order size sent to broker at once
+  max_total_lot_per_signal: 50.00      # Maximum aggregate parent order exposure
+  max_liquidity_participation_rate: 0.05
+  twap_slice_interval_seconds: 1.50
+  iceberg_jitter_pct: 0.12             # Randomized slice sizing within volume_step to mask footprint
+  max_adverse_drift_atr: 0.35          # Abort remaining TWAP slices if price moves adversely
+
+backtest_and_validation:
+  initial_equity: 100000.0
+  commission_per_lot_usd: 3.50
+  slippage_points: 2.0
+  purged_cv_splits: 5
+  embargo_pct: 0.02
+  wfo_train_bars: 2400
+  wfo_test_bars: 600
+  min_sharpe_target: 2.00
+  monte_carlo_iterations: 1000
+  monte_carlo_block_size: 10
+  monte_carlo_stress_slippage_mult: 1.25
+
+execution_and_monitoring:
+  mt5_login: 0                         # Populated via env MT5_LOGIN on live VPS
+  mt5_server: ""                       # Populated via env MT5_SERVER on live VPS
+  mt5_terminal_path: ""                # Optional path to terminal64.exe
+  magic_number: 20261110
+  max_deviation_points: 15
+  max_spread_points: 35.0
+  max_spread_atr_ratio: 0.25
+  max_order_retries: 3
+  retry_backoff_seconds: 0.25
+  reconnect_max_attempts: 5
+  reconnect_base_delay_seconds: 1.0
+  rollover_start_utc: "23:50"
+  rollover_end_utc: "00:15"
+  friday_stop_hour_utc: 21
+  news_blackout_before_minutes: 30
+  news_blackout_after_minutes: 30
+  database:
+    backend: "sqlite"                  # "sqlite" or "postgresql"
+    sqlite_path: "artifacts/trading_audit.db"
+    postgres_dsn: ""                   # Optional e.g. postgresql://user:pass@localhost:5432/trading

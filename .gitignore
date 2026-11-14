@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts, ONNX exports, databases & logs
+artifacts/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+*.log
