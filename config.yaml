@@ -38,16 +38,16 @@ regime_ai:
   primary_onnx_filename: "primary_directional.onnx"
   meta_onnx_filename: "secondary_meta_confidence.onnx"
   # Market Regime Detection thresholds (First Principle #1)
-  hurst_trending_min: 0.55
-  hurst_mean_reverting_max: 0.45
-  abnormal_vol_zscore_ceiling: 2.50
-  abnormal_vol_ratio_ceiling: 2.20
-  min_directional_efficiency: 0.18
-  # Meta-Labeling & Triple-Barrier settings (Marcos Lopez de Prado)
-  meta_confidence_threshold: 0.62
-  triple_barrier_pt_atr: 2.20
-  triple_barrier_sl_atr: 1.10
-  triple_barrier_max_bars: 24
+  hurst_trending_min: 0.54
+  hurst_mean_reverting_max: 0.46
+  abnormal_vol_zscore_ceiling: 2.80
+  abnormal_vol_ratio_ceiling: 2.60
+  min_directional_efficiency: 0.16
+  # Meta-Labeling & Triple-Barrier settings (Marcos Lopez de Prado, aligned 1:1 with SL/TP)
+  meta_confidence_threshold: 0.46
+  triple_barrier_pt_atr: 3.30
+  triple_barrier_sl_atr: 1.50
+  triple_barrier_max_bars: 156
   # LightGBM hyperparameters
   n_estimators: 120
   learning_rate: 0.04

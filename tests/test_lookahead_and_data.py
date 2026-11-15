@@ -182,3 +182,111 @@ def test_purged_kfold_zero_horizon_overlap_and_embargo():
             # Embargo check after test block
             if i > test_idx[-1]:
                 assert i >= test_idx[-1] + 1 + 10
+
+
+def test_dynamic_breakeven_and_trailing_stop_zero_intrabar_lookahead():
+    """
+    Prove simulate_dynamic_barrier_trade:
+    1. Checks initial SL pessimistically BEFORE applying any same-bar favorable excursion ratchet.
+    2. Locks +0.15R Breakeven only AFTER a bar closes with >= +1.0R favorable excursion, protecting bar j+1.
+    """
+    from regime_ai_engine.triple_barrier import simulate_dynamic_barrier_trade
+
+    # Bar 0: entry close = 2000.0, ATR = 2.0 -> SL dist = 1.5 * 2.0 = 3.0 (initial SL = 1997.0), TP = 2006.6
+    # Case A: Bar 1 spikes up +1.2R (high=2003.8) AND wicked down to 1996.9 in the SAME bar -> must hit initial SL (-1.0R)!
+    closes_a = np.array([2000.0, 2002.0, 2002.0])
+    highs_a = np.array([2000.5, 2003.8, 2002.5])
+    lows_a = np.array([1999.5, 1996.9, 2001.5])
+    atrs = np.array([2.0, 2.0, 2.0])
+    spreads = np.zeros(3)
+
+    exit_idx_a, _, _, reason_a, r_a = simulate_dynamic_barrier_trade(
+        entry_idx=0,
+        side=1,
+        closes=closes_a,
+        highs=highs_a,
+        lows=lows_a,
+        atrs=atrs,
+        spreads_price=spreads,
+        sl_atr_mult=1.5,
+        pt_atr_mult=3.3,
+        max_holding_bars=10,
+    )
+    assert exit_idx_a == 1
+    assert reason_a == "STOP_LOSS"
+    assert r_a == pytest.approx(-1.0)
+
+    # Case B: Bar 1 rallies cleanly to +1.8R (high=2005.4, close=2004.8, low=1999.8 -> survives!),
+    # then Bar 2 reverses sharply down to 1998.0 -> exits at late-stage Breakeven+buffer (2000.0 + 0.35*3.0 = 2001.05 -> +0.35R)!
+    closes_b = np.array([2000.0, 2004.8, 1998.5])
+    highs_b = np.array([2000.5, 2005.4, 2004.9])
+    lows_b = np.array([1999.5, 1999.8, 1998.0])
+
+    exit_idx_b, _, exit_px_b, reason_b, r_b = simulate_dynamic_barrier_trade(
+        entry_idx=0,
+        side=1,
+        closes=closes_b,
+        highs=highs_b,
+        lows=lows_b,
+        atrs=atrs,
+        spreads_price=spreads,
+        sl_atr_mult=1.5,
+        pt_atr_mult=3.3,
+        max_holding_bars=10,
+    )
+    assert exit_idx_b == 2
+    assert reason_b == "TRAILING_STOP"
+    assert exit_px_b == pytest.approx(2001.05)
+    assert r_b == pytest.approx(0.35)
+
+
+def test_regime_aligned_candidate_never_fights_macro_trend():
+    """Verify build_meta_feature_matrix never shorts TRENDING_BULL or longs TRENDING_BEAR."""
+    from regime_ai_engine.meta_labeling_models import build_meta_feature_matrix
+
+    rng = np.random.default_rng(99)
+    n = 200
+    X_prim = rng.normal(0.0, 0.5, size=(n, len(PRIMARY_FEATURE_COLUMNS))).astype(np.float32)
+    raw_probs = rng.uniform(0.05, 0.95, size=(n, 3)).astype(np.float32)
+    raw_probs /= raw_probs.sum(axis=1, keepdims=True)
+    spread_to_atr = np.full(n, 0.05, dtype=np.float32)
+
+    bull_regimes = np.full(n, 1.0, dtype=np.float32)
+    _, bull_sides, _ = build_meta_feature_matrix(X_prim, raw_probs, bull_regimes, spread_to_atr)
+    assert np.all(bull_sides >= 0), "Counter-trend SHORT emitted during TRENDING_BULL!"
+
+    bear_regimes = np.full(n, -1.0, dtype=np.float32)
+    _, bear_sides, _ = build_meta_feature_matrix(X_prim, raw_probs, bear_regimes, spread_to_atr)
+    assert np.all(bear_sides <= 0), "Counter-trend LONG emitted during TRENDING_BEAR!"
+
+
+def test_institutional_sleeve_signals_and_horizons():
+    """Verify sleeve IDs and session-specific holding horizons (SGE=66, COMEX=156, LondonClose=84)."""
+    from regime_ai_engine.meta_labeling_models import extract_institutional_sleeve_signals
+
+    idx_map = {col: i for i, col in enumerate(PRIMARY_FEATURE_COLUMNS)}
+    X = np.zeros((3, len(PRIMARY_FEATURE_COLUMNS)), dtype=np.float32)
+    regimes = np.full(3, 0.5, dtype=np.float32)  # MEAN_REVERTING
+
+    # Row 0: SGE window (20:45-21:30 UTC) in non-bear macro -> LONG (+1), Sleeve 1, Hold 66 bars
+    X[0, idx_map["m5_is_sge_win"]] = 1.0
+    X[0, idx_map["h4_ema_spread_atr"]] = 0.25
+
+    # Row 1: COMEX window (12:00-15:55 UTC) + 6h rally exhaustion -> SHORT (-1), Sleeve 2, Hold 156 bars
+    X[1, idx_map["m5_is_comex_win"]] = 1.0
+    X[1, idx_map["m5_ret_72"]] = 0.0060
+    X[1, idx_map["m5_ret_1"]] = -0.0005
+    X[1, idx_map["h4_ema_spread_atr"]] = 0.10
+
+    # Row 2: London-Close window (16:30-19:30 UTC) + 6h selloff exhaustion -> LONG (+1), Sleeve 3, Hold 84 bars
+    X[2, idx_map["m5_is_ldn_close_win"]] = 1.0
+    X[2, idx_map["m5_ret_72"]] = -0.0045
+    X[2, idx_map["m5_ret_1"]] = 0.0004
+    X[2, idx_map["h4_ema_spread_atr"]] = 0.20
+
+    sides, sleeves, holds = extract_institutional_sleeve_signals(X, regimes)
+    assert list(sides) == [1, -1, 1]
+    assert list(sleeves) == [1, 2, 3]
+    assert list(holds) == [66, 156, 84]
+
+

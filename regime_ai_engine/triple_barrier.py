@@ -29,7 +29,8 @@ def compute_triple_barrier_labels(
     closes = df["close"].to_numpy(dtype=np.float64)
     highs = df["high"].to_numpy(dtype=np.float64)
     lows = df["low"].to_numpy(dtype=np.float64)
-    atrs = df["m5_atr"].to_numpy(dtype=np.float64)
+    atr_col = "structural_atr" if "structural_atr" in df.columns else "m5_atr"
+    atrs = df[atr_col].to_numpy(dtype=np.float64)
     spreads = df["spread"].to_numpy(dtype=np.float64) * point
     close_times = df["close_time"].to_numpy()
 
@@ -83,29 +84,153 @@ def compute_triple_barrier_labels(
     )
 
 
+def simulate_dynamic_barrier_trade(
+    entry_idx: int,
+    side: int,
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    atrs: np.ndarray,
+    spreads_price: np.ndarray,
+    sl_atr_mult: float,
+    pt_atr_mult: float,
+    max_holding_bars: int,
+    point: float = 0.01,
+    slippage_price: float = 0.0,
+    enable_ratchet: bool = True,
+) -> tuple[int, float, float, str, float]:
+    """
+    Simulate a single directional trade with 100% causal, pessimistic intrabar execution:
+    1. On each bar `j > entry_idx`, check existing `current_sl_px` against adverse extreme FIRST.
+    2. Only if SL survived bar `j`, check `tp_px` against favorable extreme.
+    3. When `enable_ratchet=True`, apply end-of-bar late-stage profit protection strictly for bar `j + 1`.
+       When `enable_ratchet=False` (Institutional Market-Clock sleeves), hold cleanly to TP, SL, or
+       session benchmark Time-Barrier (e.g. Shanghai AM Fix 02:30 UTC).
+
+    Returns `(exit_idx, entry_px, exit_px, exit_reason, r_multiple)`.
+    """
+    n = len(closes)
+    atr_entry = max(float(atrs[entry_idx]), point * 5.0)
+    sl_dist = sl_atr_mult * atr_entry
+    tp_dist = pt_atr_mult * atr_entry
+    horizon = min(n - 1, entry_idx + max_holding_bars)
+    half_s0 = 0.5 * float(spreads_price[entry_idx])
+
+    if side == 1:
+        entry_px = float(closes[entry_idx]) + half_s0 + slippage_price
+        current_sl_px = entry_px - sl_dist
+        tp_px = entry_px + tp_dist
+        max_fav_px = entry_px
+
+        for j in range(entry_idx + 1, horizon + 1):
+            half_s = 0.5 * float(spreads_price[j])
+            bid_low = float(lows[j]) - half_s
+            bid_high = float(highs[j]) - half_s
+            bid_close = float(closes[j]) - half_s
+
+            if bid_low <= current_sl_px:
+                exit_px = current_sl_px - slippage_price
+                reason = "TRAILING_STOP" if current_sl_px > entry_px else "STOP_LOSS"
+                return j, entry_px, exit_px, reason, (exit_px - entry_px) / sl_dist
+
+            if bid_high >= tp_px:
+                exit_px = tp_px - slippage_price
+                return j, entry_px, exit_px, "TAKE_PROFIT", (exit_px - entry_px) / sl_dist
+
+            if enable_ratchet:
+                # End-of-bar causal stop ratchet (applies strictly starting on bar j + 1)
+                if bid_high > max_fav_px:
+                    max_fav_px = bid_high
+                fav_r = (max_fav_px - entry_px) / sl_dist
+                atr_j = max(float(atrs[j]), point * 5.0)
+                max_valid_sl = bid_close - 0.10 * atr_j
+
+                if fav_r >= 1.70:
+                    be_sl = min(entry_px + 0.35 * sl_dist, max_valid_sl)
+                    if be_sl > current_sl_px:
+                        current_sl_px = be_sl
+                if fav_r >= 1.95:
+                    trail_sl = min(max_fav_px - 0.85 * atr_j, max_valid_sl)
+                    if trail_sl > current_sl_px:
+                        current_sl_px = trail_sl
+
+        half_s_end = 0.5 * float(spreads_price[horizon])
+        exit_px = float(closes[horizon]) - half_s_end - slippage_price
+        return horizon, entry_px, exit_px, "TIME_BARRIER", (exit_px - entry_px) / sl_dist
+
+    # SHORT (side == -1)
+    entry_px = float(closes[entry_idx]) - half_s0 - slippage_price
+    current_sl_px = entry_px + sl_dist
+    tp_px = entry_px - tp_dist
+    min_fav_px = entry_px
+
+    for j in range(entry_idx + 1, horizon + 1):
+        half_s = 0.5 * float(spreads_price[j])
+        ask_high = float(highs[j]) + half_s
+        ask_low = float(lows[j]) + half_s
+        ask_close = float(closes[j]) + half_s
+
+        if ask_high >= current_sl_px:
+            exit_px = current_sl_px + slippage_price
+            reason = "TRAILING_STOP" if current_sl_px < entry_px else "STOP_LOSS"
+            return j, entry_px, exit_px, reason, (entry_px - exit_px) / sl_dist
+
+        if ask_low <= tp_px:
+            exit_px = tp_px + slippage_price
+            return j, entry_px, exit_px, "TAKE_PROFIT", (entry_px - exit_px) / sl_dist
+
+        if enable_ratchet:
+            # End-of-bar causal stop ratchet (applies strictly starting on bar j + 1)
+            if ask_low < min_fav_px:
+                min_fav_px = ask_low
+            fav_r = (entry_px - min_fav_px) / sl_dist
+            atr_j = max(float(atrs[j]), point * 5.0)
+            min_valid_sl = ask_close + 0.10 * atr_j
+
+            if fav_r >= 1.70:
+                be_sl = max(entry_px - 0.35 * sl_dist, min_valid_sl)
+                if be_sl < current_sl_px:
+                    current_sl_px = be_sl
+            if fav_r >= 1.95:
+                trail_sl = max(min_fav_px + 0.85 * atr_j, min_valid_sl)
+                if trail_sl < current_sl_px:
+                    current_sl_px = trail_sl
+
+    half_s_end = 0.5 * float(spreads_price[horizon])
+    exit_px = float(closes[horizon]) + half_s_end + slippage_price
+    return horizon, entry_px, exit_px, "TIME_BARRIER", (entry_px - exit_px) / sl_dist
+
+
 def compute_meta_labels_for_sides(
     df: pd.DataFrame,
     predicted_sides: np.ndarray,
-    pt_atr_mult: float = 2.2,
-    sl_atr_mult: float = 1.1,
-    max_holding_bars: int = 24,
+    pt_atr_mult: float = 3.3,
+    sl_atr_mult: float = 1.5,
+    max_holding_bars: int = 156,
     point: float = 0.01,
+    slippage_points: float = 2.0,
+    max_holding_bars_arr: np.ndarray | None = None,
+    commission_per_lot_usd: float = 3.50,
+    contract_size: float = 100.0,
+    enable_ratchet: bool = False,
 ) -> pd.DataFrame:
     """
-    Given Primary Model directional predictions `predicted_sides` in {-1, 0, +1},
-    evaluate asymmetric Triple-Barrier outcome (TP = pt_atr_mult * ATR, SL = sl_atr_mult * ATR)
-    including realistic bid-ask spread cost.
+    Given Primary directional candidate predictions `predicted_sides` in {-1, 0, +1},
+    evaluate asymmetric Triple-Barrier + sleeve-specific session horizon outcome including
+    realistic bid-ask spread, slippage, and round-turn broker commission.
 
-    Returns binary `meta_label` in {0, 1} (1 iff the directional trade achieves positive net PnL
-    via TP touch or positive vertical-barrier exit) and realized R-multiple (`r_multiple`).
+    Returns binary `meta_label` in {0, 1} (1 iff trade achieves net positive R > 0 after commission)
+    and realized net `r_multiple`.
     """
     n = len(df)
     closes = df["close"].to_numpy(dtype=np.float64)
     highs = df["high"].to_numpy(dtype=np.float64)
     lows = df["low"].to_numpy(dtype=np.float64)
-    atrs = df["m5_atr"].to_numpy(dtype=np.float64)
+    atr_col = "structural_atr" if "structural_atr" in df.columns else "m5_atr"
+    atrs = df[atr_col].to_numpy(dtype=np.float64)
     spreads = df["spread"].to_numpy(dtype=np.float64) * point
     close_times = df["close_time"].to_numpy()
+    slip_px = slippage_points * point
 
     meta_y = np.zeros(n, dtype=np.int64)
     r_mult = np.zeros(n, dtype=np.float64)
@@ -116,56 +241,27 @@ def compute_meta_labels_for_sides(
         if side == 0:
             continue
 
-        atr_i = max(atrs[i], point * 5.0)
-        half_sprd = 0.5 * spreads[i]
-        sl_dist = sl_atr_mult * atr_i
-        tp_dist = pt_atr_mult * atr_i
-        horizon_end = min(n - 1, i + max_holding_bars)
-        end_j = horizon_end
-
-        if side == 1:
-            entry_px = closes[i] + half_sprd
-            tp_px = entry_px + tp_dist
-            sl_px = entry_px - sl_dist
-            outcome_r = None
-            for j in range(i + 1, horizon_end + 1):
-                # Conservative intrabar check: check SL against bid (low - half_sprd) first
-                bid_low = lows[j] - half_sprd
-                bid_high = highs[j] - half_sprd
-                if bid_low <= sl_px:
-                    outcome_r = -1.0
-                    end_j = j
-                    break
-                if bid_high >= tp_px:
-                    outcome_r = tp_dist / sl_dist
-                    end_j = j
-                    break
-            if outcome_r is None:
-                exit_px = closes[horizon_end] - half_sprd
-                outcome_r = (exit_px - entry_px) / sl_dist
-        else:
-            entry_px = closes[i] - half_sprd
-            tp_px = entry_px - tp_dist
-            sl_px = entry_px + sl_dist
-            outcome_r = None
-            for j in range(i + 1, horizon_end + 1):
-                ask_high = highs[j] + half_sprd
-                ask_low = lows[j] + half_sprd
-                if ask_high >= sl_px:
-                    outcome_r = -1.0
-                    end_j = j
-                    break
-                if ask_low <= tp_px:
-                    outcome_r = tp_dist / sl_dist
-                    end_j = j
-                    break
-            if outcome_r is None:
-                exit_px = closes[horizon_end] + half_sprd
-                outcome_r = (entry_px - exit_px) / sl_dist
-
+        hold_i = int(max_holding_bars_arr[i]) if max_holding_bars_arr is not None else max_holding_bars
+        end_j, _, _, _, outcome_r = simulate_dynamic_barrier_trade(
+            entry_idx=i,
+            side=side,
+            closes=closes,
+            highs=highs,
+            lows=lows,
+            atrs=atrs,
+            spreads_price=spreads,
+            sl_atr_mult=sl_atr_mult,
+            pt_atr_mult=pt_atr_mult,
+            max_holding_bars=hold_i,
+            point=point,
+            slippage_price=slip_px,
+            enable_ratchet=enable_ratchet,
+        )
+        comm_r = commission_per_lot_usd / max(sl_atr_mult * float(atrs[i]) * contract_size, 1e-6)
+        net_r = float(outcome_r) - comm_r
         end_indices[i] = end_j
-        r_mult[i] = float(outcome_r)
-        meta_y[i] = 1 if outcome_r > 0.15 else 0
+        r_mult[i] = net_r
+        meta_y[i] = 1 if net_r > 0.0 else 0
 
     return pd.DataFrame(
         {

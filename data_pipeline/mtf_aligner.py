@@ -23,6 +23,8 @@ PRIMARY_FEATURE_COLUMNS: Tuple[str, ...] = (
     "m5_ret_1",
     "m5_ret_4",
     "m5_ret_12",
+    "m5_ret_72",
+    "m5_ret_144",
     "m5_atr_pct",
     "m5_parkinson_vol",
     "m5_annual_vol",
@@ -31,15 +33,30 @@ PRIMARY_FEATURE_COLUMNS: Tuple[str, ...] = (
     "m5_vol_ratio",
     "m5_hurst",
     "m5_efficiency",
+    "m5_ema_spread_atr",
+    "m5_dist_ema_fast_atr",
+    "m5_rsi",
+    "m5_donchian_pos",
     "m5_vp_dist_poc_atr",
     "m5_vp_pos_in_va",
     "m5_tick_ofi",
+    "m5_sweep_6h",
+    "m5_sweep_depth_atr",
+    "m5_session_sin",
+    "m5_session_cos",
+    "m5_is_prime_session",
+    "m5_is_sge_win",
+    "m5_is_comex_win",
+    "m5_is_ldn_close_win",
     # M15 context features
     "m15_ret_1",
     "m15_ret_4",
     "m15_zscore",
     "m15_hurst",
     "m15_efficiency",
+    "m15_ema_spread_atr",
+    "m15_rsi",
+    "m15_donchian_pos",
     "m15_vp_dist_poc_atr",
     # H1 structural features
     "h1_ret_1",
@@ -47,15 +64,23 @@ PRIMARY_FEATURE_COLUMNS: Tuple[str, ...] = (
     "h1_zscore",
     "h1_hurst",
     "h1_efficiency",
+    "h1_ema_spread_atr",
+    "h1_dist_ema_fast_atr",
+    "h1_rsi",
     "h1_vp_dist_poc_atr",
     # H4 macro-regime features
     "h4_ret_1",
+    "h4_ret_30",
+    "h4_ret_120",
     "h4_zscore",
     "h4_hurst",
     "h4_efficiency",
+    "h4_ema_spread_atr",
+    "h4_rsi",
     "h4_vp_dist_poc_atr",
     # Cross-timeframe confluence features
     "mtf_trend_alignment",
+    "mtf_ema_alignment",
     "mtf_hurst_mean",
     "mtf_zscore_divergence",
 )
@@ -163,16 +188,25 @@ class MultiTimeframeFeaturePipeline:
                 raise RuntimeError(f"CRITICAL: Look-ahead bias detected when aligning {htf.value}!")
 
         # Cross-timeframe confluence features (100% causal since inputs are already close-aligned)
+        merged = merged.copy()
         sign_m5 = np.sign(merged["m5_ret_4"].fillna(0.0))
         sign_m15 = np.sign(merged["m15_ret_4"].fillna(0.0))
         sign_h1 = np.sign(merged["h1_ret_4"].fillna(0.0))
         sign_h4 = np.sign(merged["h4_ret_1"].fillna(0.0))
 
         merged["mtf_trend_alignment"] = (sign_m5 + sign_m15 + sign_h1 + sign_h4) / 4.0
+        merged["mtf_ema_alignment"] = (
+            0.15 * np.tanh(merged["m5_ema_spread_atr"])
+            + 0.20 * np.tanh(merged["m15_ema_spread_atr"])
+            + 0.35 * np.tanh(merged["h1_ema_spread_atr"])
+            + 0.30 * np.tanh(merged["h4_ema_spread_atr"])
+        )
         merged["mtf_hurst_mean"] = (
             merged["m5_hurst"] + merged["m15_hurst"] + merged["h1_hurst"] + merged["h4_hurst"]
         ) / 4.0
         merged["mtf_zscore_divergence"] = merged["m5_zscore"] - merged["h1_zscore"]
+        m5_atr_base = np.maximum(merged["m5_atr"], 0.95 * merged["m5_atr_24h"])
+        merged["structural_atr"] = 2.8 * m5_atr_base
 
         if drop_warmup_nans:
             merged = merged.dropna(subset=list(PRIMARY_FEATURE_COLUMNS)).reset_index(drop=True)
@@ -200,6 +234,7 @@ class MultiTimeframeFeaturePipeline:
 
         ts = row["close_time"]
         ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        eff_atr = float(row["structural_atr"]) if "structural_atr" in row and pd.notna(row["structural_atr"]) else float(row["m5_atr"])
 
         return MarketSnapshot(
             symbol=symbol_spec.symbol,
@@ -207,7 +242,7 @@ class MultiTimeframeFeaturePipeline:
             bid=bid,
             ask=ask,
             close=close_px,
-            atr=float(row["m5_atr"]),
+            atr=eff_atr,
             parkinson_vol=float(row["m5_parkinson_vol"]),
             realized_annual_vol=float(row["m5_annual_vol"]),
             hurst_exponent=float(row["m5_hurst"]),

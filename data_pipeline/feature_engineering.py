@@ -253,9 +253,19 @@ def build_single_timeframe_features(
     else:
         annual_vol = realized_vol
 
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
     price_zscore = compute_rolling_zscore(close, window=zscore_window)
-    vol_zscore = compute_rolling_zscore(parkinson, window=zscore_window)
-    long_vol = parkinson.rolling(window=zscore_window, min_periods=parkinson_window).median()
+    # Use full 24h cycle (288 M5 bars) for M5 volatility regime baseline so normal London/NY opens
+    # are not misclassified as abnormal shocks relative to quiet Asian hours.
+    vol_base_win = max(zscore_window, 288) if prefix == "m5" else zscore_window
+    vol_mean = parkinson.rolling(window=vol_base_win, min_periods=zscore_window).mean()
+    vol_std = parkinson.rolling(window=vol_base_win, min_periods=zscore_window).std(ddof=1)
+    vol_zscore = ((parkinson - vol_mean) / vol_std.where(vol_std > EPS, np.nan)).fillna(0.0).where(
+        vol_mean.notna(), np.nan
+    )
+    long_vol = parkinson.rolling(window=vol_base_win, min_periods=parkinson_window).median()
     vol_ratio = (parkinson / long_vol.where(long_vol > EPS, np.nan)).fillna(1.0)
 
     hurst = compute_rolling_hurst_exponent(close, window=hurst_window)
@@ -270,6 +280,23 @@ def build_single_timeframe_features(
     safe_atr = atr.where(atr > EPS, np.nan)
     va_width = (vp_df["vp_vah"] - vp_df["vp_val"]).where((vp_df["vp_vah"] - vp_df["vp_val"]) > EPS, np.nan)
 
+    # Causal institutional EMA trend structure, Wilder RSI, and Donchian channel position
+    ema_fast = close.ewm(span=20, min_periods=10, adjust=False).mean()
+    ema_slow = close.ewm(span=55, min_periods=20, adjust=False).mean()
+    ema_spread_atr = (ema_fast - ema_slow) / safe_atr
+    dist_ema_fast_atr = (close - ema_fast) / safe_atr
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+    loss = (-delta.clip(upper=0.0)).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+    rs = gain / loss.clip(lower=EPS)
+    rsi_centered = (1.0 - (1.0 / (1.0 + rs))) - 0.5  # [-0.5, +0.5]
+
+    donchian_hi = high.rolling(window=20, min_periods=14).max()
+    donchian_lo = low.rolling(window=20, min_periods=14).min()
+    donchian_span = (donchian_hi - donchian_lo).where((donchian_hi - donchian_lo) > EPS, np.nan)
+    donchian_pos = ((close - donchian_lo) / donchian_span).fillna(0.5)
+
     feat[f"{prefix}_ret_1"] = log_ret
     feat[f"{prefix}_ret_4"] = np.log(close.clip(lower=EPS) / close.shift(4).clip(lower=EPS))
     feat[f"{prefix}_ret_12"] = np.log(close.clip(lower=EPS) / close.shift(12).clip(lower=EPS))
@@ -282,6 +309,10 @@ def build_single_timeframe_features(
     feat[f"{prefix}_vol_ratio"] = vol_ratio
     feat[f"{prefix}_hurst"] = hurst
     feat[f"{prefix}_efficiency"] = efficiency
+    feat[f"{prefix}_ema_spread_atr"] = ema_spread_atr
+    feat[f"{prefix}_dist_ema_fast_atr"] = dist_ema_fast_atr
+    feat[f"{prefix}_rsi"] = rsi_centered
+    feat[f"{prefix}_donchian_pos"] = donchian_pos
     feat[f"{prefix}_vp_poc"] = vp_df["vp_poc"]
     feat[f"{prefix}_vp_vah"] = vp_df["vp_vah"]
     feat[f"{prefix}_vp_val"] = vp_df["vp_val"]
@@ -292,5 +323,45 @@ def build_single_timeframe_features(
         micro = compute_tick_microstructure_features(df, ticks_df=ticks_df)
         feat["m5_tick_ofi"] = micro["tick_ofi"]
         feat["m5_effective_spread"] = micro["effective_spread"]
+        feat["m5_atr_24h"] = atr.rolling(window=288, min_periods=1).mean()
+        feat["m5_ret_72"] = ((close / close.shift(72).clip(lower=EPS)) - 1.0).fillna(0.0)
+        feat["m5_ret_144"] = ((close / close.shift(144).clip(lower=EPS)) - 1.0).fillna(0.0)
+
+        # Causal 6-hour (72 M5 bars) prior liquidity pool high/low for institutional sweep detection
+        prev_hi_72 = high.shift(1).rolling(window=72, min_periods=24).max()
+        prev_lo_72 = low.shift(1).rolling(window=72, min_periods=24).min()
+        bull_sweep = (low < prev_lo_72) & (close > prev_lo_72)
+        bear_sweep = (high > prev_hi_72) & (close < prev_hi_72)
+        sweep_sign = np.where(bull_sweep, 1.0, np.where(bear_sweep, -1.0, 0.0))
+        bull_depth = ((prev_lo_72 - low) / safe_atr).clip(0.0, 3.0).fillna(0.0)
+        bear_depth = ((high - prev_hi_72) / safe_atr).clip(0.0, 3.0).fillna(0.0)
+        sweep_depth = np.where(bull_sweep, bull_depth, np.where(bear_sweep, -bear_depth, 0.0))
+
+        feat["m5_sweep_6h"] = sweep_sign
+        feat["m5_sweep_depth_atr"] = sweep_depth
+
+        ts_utc = pd.to_datetime(df["close_time"], utc=True)
+        dow = ts_utc.dt.day_of_week.to_numpy()
+        hours = ts_utc.dt.hour.to_numpy()
+        mins = ts_utc.dt.minute.to_numpy()
+        hour_frac = hours.astype(float) + mins.astype(float) / 60.0
+        no_fri_night = (dow <= 4) & (~((dow == 4) & (hours >= 19)))
+
+        feat["m5_session_sin"] = np.sin(2.0 * math.pi * hour_frac / 24.0)
+        feat["m5_session_cos"] = np.cos(2.0 * math.pi * hour_frac / 24.0)
+        feat["m5_is_prime_session"] = ((hour_frac >= 7.0) & (hour_frac <= 20.5)).astype(float)
+        # Institutional Bullion Market-Clock Handoff Windows (UTC)
+        feat["m5_is_sge_win"] = (
+            no_fri_night & (((hours == 20) & (mins >= 45)) | ((hours == 21) & (mins <= 30)))
+        ).astype(float)
+        feat["m5_is_comex_win"] = (no_fri_night & (hours >= 12) & (hours <= 15)).astype(float)
+        feat["m5_is_ldn_close_win"] = (
+            no_fri_night & (((hours == 16) & (mins >= 30)) | ((hours >= 17) & (hours <= 19)))
+        ).astype(float)
+
+    if prefix == "h4":
+        # Causal ~5-day (30 H4 bars) and ~20-day (120 H4 bars) macro regime return filters
+        feat["h4_ret_30"] = ((close / close.shift(30).clip(lower=EPS)) - 1.0).fillna(0.0)
+        feat["h4_ret_120"] = ((close / close.shift(120).clip(lower=EPS)) - 1.0).fillna(0.0)
 
     return feat

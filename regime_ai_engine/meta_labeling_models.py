@@ -29,10 +29,15 @@ from regime_ai_engine.triple_barrier import (
     compute_triple_barrier_labels,
 )
 
+_PRIM_COL_IDX = {name: idx for idx, name in enumerate(PRIMARY_FEATURE_COLUMNS)}
+
 META_AUX_COLUMNS: Tuple[str, ...] = (
     "primary_side_num",
-    "primary_max_prob",
+    "primary_side_prob",
+    "primary_dir_skew",
     "primary_margin_prob",
+    "sleeve_id_code",
+    "structural_confluence",
     "regime_code",
     "spread_to_atr_ratio",
 )
@@ -72,6 +77,66 @@ def _export_lgbm_to_onnx_bytes(model: lgb.LGBMClassifier, num_features: int) -> 
     return onnx_model.SerializeToString()
 
 
+def extract_institutional_sleeve_signals(
+    X_primary: np.ndarray,
+    regime_codes: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract strictly causal Institutional Bullion Market-Clock candidate signals:
+      - Sleeve 1 (ID=1, Hold=66 bars / 5.5h): NY COMEX Close -> Shanghai SGE AM Fix Accumulation LONG
+      - Sleeve 2 (ID=2, Hold=156 bars / 13.0h): COMEX / LBMA PM Fix Handoff 6h Exhaustion LONG & SHORT
+      - Sleeve 3 (ID=3, Hold=84 bars / 7.0h): London Close / COMEX Settlement Selloff Exhaustion LONG
+
+    Strictly enforces Macro Regime Alignment:
+      - Never emits LONG during TRENDING_BEAR (-1.0) or multi-week macro bear trend.
+      - Never emits SHORT during TRENDING_BULL (+1.0) or multi-day macro bull surge.
+    """
+    m5_ret1 = X_primary[:, _PRIM_COL_IDX["m5_ret_1"]]
+    ret_6h = X_primary[:, _PRIM_COL_IDX["m5_ret_72"]]
+    ret_12h = X_primary[:, _PRIM_COL_IDX["m5_ret_144"]]
+    is_sge_win = X_primary[:, _PRIM_COL_IDX["m5_is_sge_win"]] > 0.5
+    is_comex_win = X_primary[:, _PRIM_COL_IDX["m5_is_comex_win"]] > 0.5
+    is_ldn_win = X_primary[:, _PRIM_COL_IDX["m5_is_ldn_close_win"]] > 0.5
+    h4_ema = X_primary[:, _PRIM_COL_IDX["h4_ema_spread_atr"]]
+    ret_5d = X_primary[:, _PRIM_COL_IDX["h4_ret_30"]]
+    ret_20d = X_primary[:, _PRIM_COL_IDX["h4_ret_120"]]
+
+    is_bull = np.isclose(regime_codes, 1.0)
+    is_bear = np.isclose(regime_codes, -1.0)
+    is_mr = np.isclose(regime_codes, 0.5)
+    tradable = is_bull | is_bear | is_mr
+
+    not_macro_bear = (~is_bear) & (h4_ema > -0.20) & (ret_20d > -0.010) & (ret_5d > -0.012)
+    not_macro_bull = (~is_bull) & (h4_ema < 0.65) & (ret_5d < 0.016)
+
+    sge_long = tradable & is_sge_win & not_macro_bear & (ret_12h < 0.008)
+    comex_long = tradable & is_comex_win & not_macro_bear & (ret_6h <= -0.0042) & (m5_ret1 > 0.0)
+    comex_short = tradable & is_comex_win & not_macro_bull & (ret_6h >= 0.0042) & (m5_ret1 < 0.0)
+    ldn_long = tradable & is_ldn_win & not_macro_bear & (ret_6h <= -0.0032) & (m5_ret1 > 0.0)
+
+    active_side = np.where(
+        comex_long | ldn_long,
+        1,
+        np.where(comex_short, -1, np.where(sge_long, 1, 0)),
+    ).astype(np.int64)
+
+    # Hard regime invariant guarantee
+    active_side = np.where(
+        is_bull & (active_side < 0),
+        0,
+        np.where(is_bear & (active_side > 0), 0, active_side),
+    ).astype(np.int64)
+
+    raw_sleeve = np.where(
+        comex_long | comex_short,
+        2,
+        np.where(ldn_long, 3, np.where(sge_long, 1, 0)),
+    ).astype(np.int64)
+    sleeve_id = np.where(active_side != 0, raw_sleeve, 0).astype(np.int64)
+    hold_bars = np.where(sleeve_id == 2, 156, np.where(sleeve_id == 3, 84, 66)).astype(np.int64)
+    return active_side, sleeve_id, hold_bars
+
+
 def build_meta_feature_matrix(
     X_primary: np.ndarray,
     primary_probs: np.ndarray,
@@ -79,33 +144,52 @@ def build_meta_feature_matrix(
     spread_to_atr: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Construct Secondary Meta-Model input matrix from Primary class probabilities [P(-1), P(0), P(+1)].
-    Selects directional side (+1 vs -1) when directional confidence exceeds flat probability or
-    shows decisive directional skew, then lets the Meta-Model filter low-probability setups.
+    Construct Secondary Meta-Model input matrix from Primary class probabilities [P(-1), P(0), P(+1)]
+    and strictly causal Institutional Bullion Market-Clock & Macro Regime alignment.
     """
     p_short = primary_probs[:, 0]
-    p_flat = primary_probs[:, 1]
     p_long = primary_probs[:, 2]
 
-    directional_side = np.where(p_long >= p_short, 1, -1)
-    max_dir_prob = np.maximum(p_long, p_short)
-    # Trigger candidate directional signal if max directional prob beats flat or >= 0.34
-    active_side = np.where((max_dir_prob >= p_flat) | (max_dir_prob >= 0.34), directional_side, 0)
+    m5_ofi = X_primary[:, _PRIM_COL_IDX["m5_tick_ofi"]]
+    ret_6h = X_primary[:, _PRIM_COL_IDX["m5_ret_72"]]
+    mtf_ema = X_primary[:, _PRIM_COL_IDX["mtf_ema_alignment"]]
+
+    active_side, sleeve_id, _ = extract_institutional_sleeve_signals(
+        X_primary=X_primary,
+        regime_codes=regime_codes,
+    )
+
+    side_prob = np.where(
+        active_side == 1,
+        p_long,
+        np.where(active_side == -1, p_short, np.maximum(p_long, p_short)),
+    )
+    dir_skew = (p_long - p_short) * active_side.astype(np.float64)
 
     sorted_probs = np.sort(primary_probs, axis=1)
     margin_prob = sorted_probs[:, -1] - sorted_probs[:, -2]
 
+    # Signed confluence combining macro EMA alignment, exhaustion stretch, and order flow
+    structural_confluence = (
+        0.40 * mtf_ema * active_side
+        - 0.35 * np.clip(ret_6h * 100.0, -2.0, 2.0) * active_side
+        + 0.25 * m5_ofi * active_side
+    )
+
     aux = np.column_stack(
         [
             active_side.astype(np.float32),
-            max_dir_prob.astype(np.float32),
+            side_prob.astype(np.float32),
+            dir_skew.astype(np.float32),
             margin_prob.astype(np.float32),
+            sleeve_id.astype(np.float32),
+            structural_confluence.astype(np.float32),
             regime_codes.astype(np.float32),
             spread_to_atr.astype(np.float32),
         ]
     )
     X_meta = np.hstack([X_primary.astype(np.float32), aux]).astype(np.float32)
-    return X_meta, active_side.astype(np.int64), max_dir_prob.astype(np.float64)
+    return X_meta, active_side.astype(np.int64), side_prob.astype(np.float64)
 
 
 class MetaLabelingTrainer:
@@ -126,10 +210,10 @@ class MetaLabelingTrainer:
         return lgb.LGBMClassifier(
             objective="multiclass",
             num_class=3,
-            n_estimators=self._cfg.n_estimators,
+            n_estimators=min(80, self._cfg.n_estimators),
             learning_rate=self._cfg.learning_rate,
-            max_depth=self._cfg.max_depth,
-            num_leaves=self._cfg.num_leaves,
+            max_depth=3,
+            num_leaves=7,
             min_child_samples=self._cfg.min_child_samples,
             subsample=self._cfg.subsample,
             colsample_bytree=self._cfg.colsample_bytree,
@@ -139,16 +223,19 @@ class MetaLabelingTrainer:
             verbose=-1,
         )
 
-    def _make_meta_estimator(self) -> lgb.LGBMClassifier:
+    def _make_meta_estimator(self, n_samples: int = 300) -> lgb.LGBMClassifier:
+        min_leaf = max(16, min(45, n_samples // 8))
         return lgb.LGBMClassifier(
             objective="binary",
-            n_estimators=self._cfg.n_estimators,
-            learning_rate=self._cfg.learning_rate,
-            max_depth=max(3, self._cfg.max_depth - 1),
-            num_leaves=max(7, self._cfg.num_leaves // 2),
-            min_child_samples=max(15, self._cfg.min_child_samples // 2),
-            subsample=self._cfg.subsample,
-            colsample_bytree=self._cfg.colsample_bytree,
+            n_estimators=min(45, self._cfg.n_estimators),
+            learning_rate=0.025,
+            max_depth=2,
+            num_leaves=3,
+            min_child_samples=min_leaf,
+            subsample=0.80,
+            colsample_bytree=0.65,
+            reg_alpha=1.5,
+            reg_lambda=4.0,
             random_state=self._seed + 17,
             n_jobs=1,
             verbose=-1,
@@ -173,14 +260,15 @@ class MetaLabelingTrainer:
         regimes = self._regime_detector.classify_dataframe(clean_df)
         regime_codes = np.array([REGIME_TO_NUMERIC_CODE[MarketRegime(r)] for r in regimes], dtype=np.float32)
         spread_price = clean_df["spread"].to_numpy(dtype=np.float32) * float(self._spec.point)
-        atr_vals = np.maximum(clean_df["m5_atr"].to_numpy(dtype=np.float32), float(self._spec.point))
+        atr_col = "structural_atr" if "structural_atr" in clean_df.columns else "m5_atr"
+        atr_vals = np.maximum(clean_df[atr_col].to_numpy(dtype=np.float32), float(self._spec.point))
         spread_to_atr = spread_price / atr_vals
 
         tb_df = compute_triple_barrier_labels(
             df=clean_df,
             pt_atr_mult=self._cfg.triple_barrier_pt_atr,
             sl_atr_mult=self._cfg.triple_barrier_sl_atr,
-            max_holding_bars=self._cfg.triple_barrier_max_bars,
+            max_holding_bars=min(48, self._cfg.triple_barrier_max_bars),
             point=self._spec.point,
         )
         y_prim_raw = tb_df["primary_label"].to_numpy(dtype=np.int64)
@@ -213,7 +301,8 @@ class MetaLabelingTrainer:
         final_primary = self._make_primary_estimator()
         final_primary.fit(X_prim, y_prim_cls)
 
-        # Step 3: Build Secondary Meta-Labels from OOF Primary directional predictions
+        # Step 3: Build Secondary Meta-Labels from OOF Primary + Institutional Sleeve signals
+        _, oof_sleeves, oof_hold_bars = extract_institutional_sleeve_signals(X_prim, regime_codes)
         X_meta_oof, oof_sides, _ = build_meta_feature_matrix(
             X_primary=X_prim,
             primary_probs=oof_probs,
@@ -227,11 +316,34 @@ class MetaLabelingTrainer:
             sl_atr_mult=self._cfg.triple_barrier_sl_atr,
             max_holding_bars=self._cfg.triple_barrier_max_bars,
             point=self._spec.point,
+            max_holding_bars_arr=oof_hold_bars,
+            contract_size=self._spec.contract_size,
+            enable_ratchet=False,
         )
         y_meta = meta_label_df["meta_label"].to_numpy(dtype=np.int64)
+        end_idx_arr = meta_label_df["event_end_idx"].to_numpy(dtype=np.int64)
 
-        active_mask = oof_sides != 0
-        if int(np.sum(active_mask)) >= 30:
+        # De-cluster consecutive M5 bars per sleeve so SGE (10 bars/night) does not 10x-dominate COMEX/London
+        declustered_mask = np.zeros(n, dtype=bool)
+        last_slv_entry: dict[int, int] = {}
+        active_slv_exit: dict[int, int] = {}
+        for idx_i in range(n - 1):
+            if oof_sides[idx_i] == 0 or end_idx_arr[idx_i] >= (n - 1):
+                continue
+            s_id = int(oof_sleeves[idx_i])
+            if idx_i < active_slv_exit.get(s_id, -1):
+                continue
+            if (idx_i - last_slv_entry.get(s_id, -999)) < 36:
+                continue
+            declustered_mask[idx_i] = True
+            last_slv_entry[s_id] = idx_i
+            active_slv_exit[s_id] = int(end_idx_arr[idx_i])
+
+        active_mask = (oof_sides != 0) & (end_idx_arr < (n - 1))
+        if int(np.sum(declustered_mask)) >= 30:
+            X_meta_train = X_meta_oof[declustered_mask]
+            y_meta_train = y_meta[declustered_mask].copy()
+        elif int(np.sum(active_mask)) >= 30:
             X_meta_train = X_meta_oof[active_mask]
             y_meta_train = y_meta[active_mask].copy()
         else:
@@ -242,7 +354,7 @@ class MetaLabelingTrainer:
             y_meta_train[0] = 0
             y_meta_train[-1] = 1
 
-        final_meta = self._make_meta_estimator()
+        final_meta = self._make_meta_estimator(n_samples=len(X_meta_train))
         final_meta.fit(X_meta_train, y_meta_train)
 
         meta_train_probs = final_meta.predict_proba(X_meta_train)[:, 1]

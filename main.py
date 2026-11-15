@@ -147,13 +147,18 @@ class TradingSystemOrchestrator:
             return None
 
         entry_px = live_tick.ask if ai_decision.primary_side == SignalSide.LONG else live_tick.bid
+        port_vol_proxy = (
+            0.75
+            * self._cfg.risk_and_scaling.target_annual_volatility
+            * min(2.5, max(0.6, snapshot.vol_ratio))
+        )
         size_res = self._sizer.calculate_position_size(
             equity=account.equity,
             side=ai_decision.primary_side,
             entry_price=entry_px,
             atr=snapshot.atr,
             spread_price=live_tick.spread_price,
-            realized_annual_vol=snapshot.realized_annual_vol,
+            realized_annual_vol=port_vol_proxy,
             win_probability=ai_decision.meta_win_probability,
             reward_to_risk_ratio=ai_decision.reward_to_risk_ratio,
             circuit_status=cb_status,

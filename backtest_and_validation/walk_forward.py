@@ -27,7 +27,10 @@ from core.config_loader import AppConfig
 from core.contracts import MarketRegime, SignalSide
 from regime_ai_engine.meta_labeling_models import MetaLabelingTrainer
 from regime_ai_engine.onnx_inference import ONNXMetaLabelingEngine
-from regime_ai_engine.triple_barrier import compute_meta_labels_for_sides
+from regime_ai_engine.triple_barrier import (
+    compute_meta_labels_for_sides,
+    simulate_dynamic_barrier_trade,
+)
 from risk_and_scaling_engine.circuit_breaker import EquityCircuitBreaker
 from risk_and_scaling_engine.position_sizer import InverseVolatilityPositionSizer
 
@@ -66,7 +69,7 @@ class WalkForwardOptimizer:
         meta_bytes: bytes,
     ) -> float:
         """Select confidence threshold maximizing risk-adjusted expectancy strictly inside IS."""
-        candidates = (0.52, 0.56, 0.60, 0.64, 0.68)
+        candidates = (0.45, 0.47, 0.49)
         best_thr = self._cfg.regime_ai.meta_confidence_threshold
         best_score = -1e9
 
@@ -76,47 +79,73 @@ class WalkForwardOptimizer:
             symbol_spec=self._cfg.symbol_spec,
             primary_model_source=primary_bytes,
             meta_model_source=meta_bytes,
-            confidence_threshold_override=0.50,
+            confidence_threshold_override=0.36,
         )
-        sides_50, _, meta_probs, regimes = base_engine.evaluate_batch_dataframe(val_df)
+        sides_base, slv_base, hold_bars, _, meta_probs, regimes = base_engine.evaluate_batch_with_sleeves(val_df)
+
+        # De-cluster consecutive M5 candidate bars per sleeve to match live execution
+        eval_sides = np.zeros_like(sides_base)
+        last_entry_slv: Dict[int, int] = {}
+        for idx_i in range(len(sides_base)):
+            s_id = int(slv_base[idx_i])
+            if sides_base[idx_i] != 0 and s_id > 0 and (idx_i - last_entry_slv.get(s_id, -999)) >= 36:
+                eval_sides[idx_i] = sides_base[idx_i]
+                last_entry_slv[s_id] = idx_i
+
         outcomes = compute_meta_labels_for_sides(
             df=val_df,
-            predicted_sides=sides_50,
-            pt_atr_mult=self._cfg.regime_ai.triple_barrier_pt_atr,
-            sl_atr_mult=self._cfg.regime_ai.triple_barrier_sl_atr,
+            predicted_sides=eval_sides,
+            pt_atr_mult=self._cfg.risk_and_scaling.atr_tp_multiplier,
+            sl_atr_mult=self._cfg.risk_and_scaling.atr_stop_multiplier,
             max_holding_bars=self._cfg.regime_ai.triple_barrier_max_bars,
             point=self._cfg.symbol_spec.point,
+            slippage_points=self._cfg.backtest_and_validation.slippage_points,
+            max_holding_bars_arr=hold_bars,
+            commission_per_lot_usd=self._cfg.backtest_and_validation.commission_per_lot_usd,
+            contract_size=self._cfg.symbol_spec.contract_size,
+            enable_ratchet=False,
         )
         r_mult = outcomes["r_multiple"].to_numpy(dtype=np.float64)
         tradable = np.array([MarketRegime(r).is_tradable for r in regimes], dtype=bool)
 
         for thr in candidates:
-            mask = tradable & (sides_50 != 0) & (meta_probs >= thr)
-            if int(np.sum(mask)) < 5:
+            mask = tradable & (eval_sides != 0) & (meta_probs >= thr)
+            if int(np.sum(mask)) < 8:
                 continue
             r_sel = r_mult[mask]
             mean_r = float(np.mean(r_sel))
+            if mean_r <= 0.02:
+                continue
             std_r = float(np.std(r_sel, ddof=1)) if len(r_sel) > 1 else 1.0
-            sharpe_like = (mean_r / max(std_r, 0.05)) * np.sqrt(float(len(r_sel)))
+            sharpe_like = (mean_r / max(std_r, 0.10)) * np.sqrt(float(len(r_sel)))
             if sharpe_like > best_score:
                 best_score = sharpe_like
                 best_thr = thr
 
         return float(best_thr)
 
-    def run(self, aligned_df: pd.DataFrame) -> WalkForwardResult:
+    def run(
+        self,
+        aligned_df: pd.DataFrame,
+        initial_train_bars: Optional[int] = None,
+        max_train_bars: int = 28800,
+        retrain_every_bars: Optional[int] = None,
+        max_concurrent_sleeves: int = 3,
+        sleeve_cooldown_bars: int = 36,
+    ) -> WalkForwardResult:
         """Run rolling Walk-Forward Optimization and stitch compounded Out-Of-Sample equity."""
         bt_cfg = self._cfg.backtest_and_validation
         rk_cfg = self._cfg.risk_and_scaling
         ai_cfg = self._cfg.regime_ai
         spec = self._cfg.symbol_spec
 
-        train_bars = bt_cfg.wfo_train_bars
-        test_bars = bt_cfg.wfo_test_bars
+        train_bars = int(initial_train_bars) if initial_train_bars is not None else bt_cfg.wfo_train_bars
+        effective_max_train = max(train_bars, int(max_train_bars))
+        test_bars = int(retrain_every_bars) if retrain_every_bars is not None else bt_cfg.wfo_test_bars
         n_total = len(aligned_df)
         if n_total < train_bars + test_bars:
             raise ValueError(
-                f"Aligned dataset ({n_total} bars) shorter than wfo_train_bars + wfo_test_bars "
+                f"Aligned dataset ({n_total} bars) shorter than train_bars + wfo_test_bars "
                 f"({train_bars + test_bars})."
             )
 
@@ -134,14 +163,31 @@ class WalkForwardOptimizer:
         equity = float(bt_cfg.initial_equity)
         oos_times: List[pd.Timestamp] = []
         oos_equities: List[float] = []
+        oos_bar_returns: List[float] = []
         trade_records: List[Dict[str, object]] = []
         fold_summaries: List[WFOFoldSummary] = []
 
+        # Global price/ATR/spread arrays for exact chronological settlement across fold boundaries
+        all_closes = aligned_df["close"].to_numpy(dtype=np.float64)
+        all_highs = aligned_df["high"].to_numpy(dtype=np.float64)
+        all_lows = aligned_df["low"].to_numpy(dtype=np.float64)
+        atr_col = "structural_atr" if "structural_atr" in aligned_df.columns else "m5_atr"
+        all_atrs = aligned_df[atr_col].to_numpy(dtype=np.float64)
+        all_vol_zscores = aligned_df["m5_vol_zscore"].to_numpy(dtype=np.float64)
+        all_spreads_pts = aligned_df["spread"].to_numpy(dtype=np.float64)
+        all_spreads_px = all_spreads_pts * spec.point
+        all_times = aligned_df["close_time"].tolist()
+
+        # Active portfolio positions: (global_exit_idx, sleeve_id, net_pnl, trade_record_dict)
+        open_positions: List[tuple[int, int, float, Dict[str, object]]] = []
+        last_sleeve_entry_global: Dict[int, int] = {}
+
+        ann_factor = np.sqrt(float(self._cfg.data_pipeline.annualization_bars_m5))
         cursor = train_bars
         fold_idx = 0
 
         while cursor + 20 <= n_total:
-            train_start = cursor - train_bars
+            train_start = max(0, cursor - effective_max_train)
             train_end = cursor
             test_end = min(n_total, cursor + test_bars)
 
@@ -156,8 +202,8 @@ class WalkForwardOptimizer:
                 embargo_pct=bt_cfg.embargo_pct,
             )
 
-            # Tune confidence threshold strictly inside last 25% of In-Sample window
-            val_tail = train_slice.iloc[int(len(train_slice) * 0.75) :].reset_index(drop=True)
+            # Tune confidence threshold strictly inside last 35% of In-Sample window
+            val_tail = train_slice.iloc[int(len(train_slice) * 0.65) :].reset_index(drop=True)
             chosen_thr = self._optimize_threshold_in_sample(
                 val_df=val_tail,
                 primary_bytes=artifacts.primary_onnx_bytes,
@@ -173,109 +219,106 @@ class WalkForwardOptimizer:
                 confidence_threshold_override=chosen_thr,
             )
 
-            sides, _, meta_probs, regimes = engine.evaluate_batch_dataframe(test_slice)
+            sides, sleeve_ids, hold_bars, _, meta_probs, regimes = engine.evaluate_batch_with_sleeves(
+                test_slice
+            )
             fold_start_eq = equity
             fold_trades = 0
-
-            closes = test_slice["close"].to_numpy(dtype=np.float64)
-            highs = test_slice["high"].to_numpy(dtype=np.float64)
-            lows = test_slice["low"].to_numpy(dtype=np.float64)
-            atrs = test_slice["m5_atr"].to_numpy(dtype=np.float64)
-            ann_vols = test_slice["m5_annual_vol"].to_numpy(dtype=np.float64)
-            vol_zscores = test_slice["m5_vol_zscore"].to_numpy(dtype=np.float64)
-            spreads_pts = test_slice["spread"].to_numpy(dtype=np.float64)
-            times = test_slice["close_time"].tolist()
 
             if fold_idx == 0:
                 oos_times.append(train_slice["close_time"].iloc[-1])
                 oos_equities.append(equity)
 
-            active_until_idx = -1
-            pending_exit_idx = -1
-            pending_net_pnl = 0.0
-            pending_trade_dict: Optional[Dict[str, object]] = None
-
             for i in range(len(test_slice)):
-                ts = times[i]
+                global_i = train_end + i
+                ts = all_times[global_i]
                 ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                prev_equity = equity
 
-                # Settle closed trade strictly at its true chronological exit bar
-                if i == pending_exit_idx:
-                    equity += pending_net_pnl
-                    if pending_trade_dict is not None:
-                        pending_trade_dict["equity_after"] = round(equity, 2)
-                        trade_records.append(pending_trade_dict)
-                        pending_trade_dict = None
-                    pending_exit_idx = -1
-                    pending_net_pnl = 0.0
+                # Settle any closed sleeve trades strictly at their chronological exit timestamp
+                still_open: List[tuple[int, int, float, Dict[str, object]]] = []
+                for exit_g_idx, slv_open, pnl_open, tr_dict in open_positions:
+                    if global_i >= exit_g_idx:
+                        equity += pnl_open
+                        tr_dict["equity_after"] = round(equity, 2)
+                        trade_records.append(tr_dict)
+                    else:
+                        still_open.append((exit_g_idx, slv_open, pnl_open, tr_dict))
+                open_positions = still_open
 
                 regime_i = MarketRegime(regimes.iloc[i])
                 cb_status = circuit_breaker.update(
                     current_equity=equity,
                     timestamp_utc=ts_dt,
                     regime=regime_i,
-                    vol_zscore=float(vol_zscores[i]),
+                    vol_zscore=float(all_vol_zscores[global_i]),
                 )
 
-                # Only evaluate new entry if flat and enough bars remain in OOS slice
-                if i > active_until_idx and i < len(test_slice) - 2 and sides[i] != 0:
-                    spread_px = float(spreads_pts[i]) * spec.point
+                # Causal trailing downside semi-volatility (1,440 M5 bars = 5 trading days)
+                if len(oos_bar_returns) >= 288:
+                    recent_rets = np.asarray(oos_bar_returns[-1440:], dtype=np.float64)
+                    neg_rets = np.minimum(0.0, recent_rets)
+                    realized_port_vol = float(np.sqrt(np.mean(neg_rets ** 2))) * ann_factor
+                else:
+                    realized_port_vol = 0.65 * rk_cfg.target_annual_volatility
+
+                # Smooth pre-circuit-breaker portfolio drawdown risk taper above 2.0% trailing DD
+                if cb_status.trailing_drawdown_pct > 0.020:
+                    stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - 0.020)
+                    realized_port_vol = max(
+                        realized_port_vol,
+                        rk_cfg.target_annual_volatility * stress_mult,
+                    )
+
+                slv_id = int(sleeve_ids[i])
+                active_sleeve_set = {s_open for _, s_open, _, _ in open_positions}
+                last_g_entry = last_sleeve_entry_global.get(slv_id, -999999)
+
+                if (
+                    global_i < n_total - 5
+                    and sides[i] != 0
+                    and slv_id > 0
+                    and slv_id not in active_sleeve_set
+                    and (global_i - last_g_entry) >= sleeve_cooldown_bars
+                    and len(open_positions) < max_concurrent_sleeves
+                    and all_spreads_pts[global_i] <= self._cfg.execution_and_monitoring.max_spread_points
+                ):
+                    spread_px = float(all_spreads_px[global_i])
                     slip_px = bt_cfg.slippage_points * spec.point
-                    side_enum = SignalSide(int(sides[i]))
-                    entry_px = (
-                        closes[i] + 0.5 * spread_px + slip_px
+                    side_int = int(sides[i])
+                    side_enum = SignalSide(side_int)
+                    entry_ref = (
+                        all_closes[global_i] + 0.5 * spread_px + slip_px
                         if side_enum == SignalSide.LONG
-                        else closes[i] - 0.5 * spread_px - slip_px
+                        else all_closes[global_i] - 0.5 * spread_px - slip_px
                     )
                     size_res = sizer.calculate_position_size(
                         equity=equity,
                         side=side_enum,
-                        entry_price=entry_px,
-                        atr=float(atrs[i]),
+                        entry_price=entry_ref,
+                        atr=float(all_atrs[global_i]),
                         spread_price=spread_px,
-                        realized_annual_vol=float(ann_vols[i]),
+                        realized_annual_vol=realized_port_vol,
                         win_probability=float(meta_probs[i]),
                         reward_to_risk_ratio=engine.reward_to_risk_ratio,
                         circuit_status=cb_status,
                     )
                     if size_res.approved and size_res.final_lots >= spec.volume_min:
-                        horizon = min(len(test_slice) - 1, i + ai_cfg.triple_barrier_max_bars)
-                        exit_idx = horizon
-                        exit_px = closes[horizon]
-                        exit_reason = "TIME_BARRIER"
-
-                        for j in range(i + 1, horizon + 1):
-                            half_s = 0.5 * float(spreads_pts[j]) * spec.point
-                            if side_enum == SignalSide.LONG:
-                                if lows[j] - half_s <= size_res.stop_loss_price:
-                                    exit_px = size_res.stop_loss_price - slip_px
-                                    exit_idx = j
-                                    exit_reason = "STOP_LOSS"
-                                    break
-                                if highs[j] - half_s >= size_res.take_profit_price:
-                                    exit_px = size_res.take_profit_price - slip_px
-                                    exit_idx = j
-                                    exit_reason = "TAKE_PROFIT"
-                                    break
-                            else:
-                                if highs[j] + half_s >= size_res.stop_loss_price:
-                                    exit_px = size_res.stop_loss_price + slip_px
-                                    exit_idx = j
-                                    exit_reason = "STOP_LOSS"
-                                    break
-                                if lows[j] + half_s <= size_res.take_profit_price:
-                                    exit_px = size_res.take_profit_price + slip_px
-                                    exit_idx = j
-                                    exit_reason = "TAKE_PROFIT"
-                                    break
-
-                        if exit_reason == "TIME_BARRIER":
-                            half_s_end = 0.5 * float(spreads_pts[exit_idx]) * spec.point
-                            exit_px = (
-                                closes[exit_idx] - half_s_end - slip_px
-                                if side_enum == SignalSide.LONG
-                                else closes[exit_idx] + half_s_end + slip_px
-                            )
+                        exit_g_idx, entry_px, exit_px, exit_reason, _ = simulate_dynamic_barrier_trade(
+                            entry_idx=global_i,
+                            side=side_int,
+                            closes=all_closes,
+                            highs=all_highs,
+                            lows=all_lows,
+                            atrs=all_atrs,
+                            spreads_price=all_spreads_px,
+                            sl_atr_mult=rk_cfg.atr_stop_multiplier,
+                            pt_atr_mult=rk_cfg.atr_tp_multiplier,
+                            max_holding_bars=int(hold_bars[i]),
+                            point=spec.point,
+                            slippage_price=slip_px,
+                            enable_ratchet=False,
+                        )
 
                         price_diff = (
                             (exit_px - entry_px)
@@ -286,16 +329,13 @@ class WalkForwardOptimizer:
                         commission = bt_cfg.commission_per_lot_usd * size_res.final_lots
                         net_pnl = gross_pnl - commission
 
-                        active_until_idx = exit_idx
-                        pending_exit_idx = exit_idx
-                        pending_net_pnl = net_pnl
-                        fold_trades += 1
-
-                        pending_trade_dict = {
+                        tr_record: Dict[str, object] = {
                             "fold": fold_idx,
+                            "sleeve": slv_id,
                             "entry_time": ts,
-                            "exit_time": times[exit_idx],
+                            "exit_time": all_times[exit_g_idx],
                             "side": side_enum.name,
+                            "regime": regime_i.value,
                             "lots": size_res.final_lots,
                             "entry_price": round(entry_px, spec.digits),
                             "exit_price": round(exit_px, spec.digits),
@@ -305,7 +345,11 @@ class WalkForwardOptimizer:
                             "net_pnl_usd": round(net_pnl, 2),
                             "equity_after": round(equity + net_pnl, 2),
                         }
+                        open_positions.append((exit_g_idx, slv_id, net_pnl, tr_record))
+                        last_sleeve_entry_global[slv_id] = global_i
+                        fold_trades += 1
 
+                oos_bar_returns.append((equity - prev_equity) / max(prev_equity, 1e-9))
                 oos_times.append(ts)
                 oos_equities.append(equity)
 
@@ -324,6 +368,14 @@ class WalkForwardOptimizer:
             )
             cursor = test_end
             fold_idx += 1
+
+        # Settle any remaining open positions landing on the terminal bar of the dataset
+        if open_positions and oos_equities:
+            for _, _, pnl_open, tr_dict in open_positions:
+                equity += pnl_open
+                tr_dict["equity_after"] = round(equity, 2)
+                trade_records.append(tr_dict)
+            oos_equities[-1] = equity
 
         eq_series = pd.Series(oos_equities, index=pd.DatetimeIndex(oos_times), name="equity")
         trades_df = pd.DataFrame(trade_records)

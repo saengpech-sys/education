@@ -158,8 +158,11 @@ def _validate_config(cfg: AppConfig) -> None:
     ai = cfg.regime_ai
     if not (0.0 < ai.hurst_mean_reverting_max < ai.hurst_trending_min < 1.0):
         raise ValueError("Hurst regime bounds must satisfy 0 < mean_reverting_max < trending_min < 1.")
-    if not (0.50 <= ai.meta_confidence_threshold < 1.0):
-        raise ValueError("meta_confidence_threshold must be within [0.50, 1.0).")
+    min_be_prob = 1.0 / (1.0 + cfg.risk_and_scaling.atr_tp_multiplier / cfg.risk_and_scaling.atr_stop_multiplier)
+    if not (min_be_prob < ai.meta_confidence_threshold < 1.0):
+        raise ValueError(
+            f"meta_confidence_threshold ({ai.meta_confidence_threshold}) must exceed asymmetric breakeven ({min_be_prob:.4f})."
+        )
 
 
 def load_config(config_path: str | Path) -> AppConfig:

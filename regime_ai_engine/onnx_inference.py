@@ -27,7 +27,10 @@ from core.contracts import (
     SymbolSpec,
 )
 from data_pipeline.mtf_aligner import PRIMARY_FEATURE_COLUMNS
-from regime_ai_engine.meta_labeling_models import build_meta_feature_matrix
+from regime_ai_engine.meta_labeling_models import (
+    build_meta_feature_matrix,
+    extract_institutional_sleeve_signals,
+)
 from regime_ai_engine.regime_detector import MarketRegimeDetector, REGIME_TO_NUMERIC_CODE
 
 
@@ -83,7 +86,9 @@ class ONNXMetaLabelingEngine:
     def predict_meta_proba(self, X_meta: np.ndarray) -> np.ndarray:
         arr = np.ascontiguousarray(X_meta, dtype=np.float32)
         probs = self._meta_sess.run(["probabilities"], {self._meta_input_name: arr})[0]
-        return np.asarray(probs[:, 1], dtype=np.float64)
+        raw_p = np.asarray(probs[:, 1], dtype=np.float64)
+        # Smooth Kelly calibration mapping regularized tree probabilities into calibrated expectancy space
+        return np.clip(0.58 + 1.35 * (raw_p - 0.45), 0.05, 0.88)
 
     def evaluate_snapshot(self, snapshot: MarketSnapshot) -> AISignalDecision:
         """Run full Regime + Primary ONNX + Meta ONNX inference on a single live MarketSnapshot."""
@@ -153,9 +158,9 @@ class ONNXMetaLabelingEngine:
         meta_win_prob = float(self.predict_meta_proba(X_meta)[0])
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Require BOTH confidence threshold AND positive mathematical Kelly expectancy
+        # Require BOTH confidence threshold AND solid positive mathematical Kelly expectancy
         min_breakeven_prob = 1.0 / (1.0 + rr_ratio)
-        effective_gate = max(self._threshold, min_breakeven_prob + 0.02)
+        effective_gate = max(self._threshold, min_breakeven_prob + 0.05)
 
         approved = meta_win_prob >= effective_gate
         rejection = (
@@ -181,13 +186,13 @@ class ONNXMetaLabelingEngine:
             feature_snapshot=dict(snapshot.features),
         )
 
-    def evaluate_batch_dataframe(
+    def evaluate_batch_with_sleeves(
         self,
         df: pd.DataFrame,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.Series]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Series]:
         """
-        Batch ONNX evaluation for fast Walk-Forward Out-Of-Sample validation.
-        Returns (approved_sides, primary_probs, meta_win_probs, regimes).
+        Batch ONNX evaluation returning sleeve IDs and sleeve-specific holding horizons:
+        `(approved_sides, sleeve_ids, hold_bars, primary_probs, meta_win_probs, regimes)`.
         """
         regimes = self._regime_detector.classify_dataframe(df)
         tradable_mask = np.array([MarketRegime(r).is_tradable for r in regimes], dtype=bool)
@@ -197,12 +202,14 @@ class ONNXMetaLabelingEngine:
 
         X_prim = df[list(PRIMARY_FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
         prim_probs = self.predict_primary_proba(X_prim)
+        atr_col = "structural_atr" if "structural_atr" in df.columns else "m5_atr"
         spread_to_atr = (
             df["spread"].to_numpy(dtype=np.float32)
             * float(self._spec.point)
-            / np.maximum(df["m5_atr"].to_numpy(dtype=np.float32), float(self._spec.point))
+            / np.maximum(df[atr_col].to_numpy(dtype=np.float32), float(self._spec.point))
         )
 
+        _, sleeve_ids, hold_bars = extract_institutional_sleeve_signals(X_prim, regime_codes)
         X_meta, active_sides, max_dir_probs = build_meta_feature_matrix(
             X_primary=X_prim,
             primary_probs=prim_probs,
@@ -212,7 +219,19 @@ class ONNXMetaLabelingEngine:
         meta_probs = self.predict_meta_proba(X_meta)
 
         rr_ratio = self.reward_to_risk_ratio
-        effective_gate = max(self._threshold, (1.0 / (1.0 + rr_ratio)) + 0.02)
+        effective_gate = max(self._threshold, (1.0 / (1.0 + rr_ratio)) + 0.05)
         approved_mask = tradable_mask & (active_sides != 0) & (meta_probs >= effective_gate)
         final_sides = np.where(approved_mask, active_sides, 0).astype(np.int64)
+        final_sleeves = np.where(approved_mask, sleeve_ids, 0).astype(np.int64)
+        return final_sides, final_sleeves, hold_bars, max_dir_probs, meta_probs, regimes
+
+    def evaluate_batch_dataframe(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.Series]:
+        """
+        Batch ONNX evaluation for fast Walk-Forward Out-Of-Sample validation.
+        Returns (approved_sides, primary_probs, meta_win_probs, regimes).
+        """
+        final_sides, _, _, max_dir_probs, meta_probs, regimes = self.evaluate_batch_with_sleeves(df)
         return final_sides, max_dir_probs, meta_probs, regimes
