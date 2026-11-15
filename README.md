@@ -3,8 +3,8 @@
 Institutional-grade quantitative algorithmic trading architecture engineered around **Ultra-Low Equity Volatility** and **Geometric Compounding**.
 
 ## Core First Principles
-1. **Volatility Targeting & Macro-Gated Market Regime Detection**: Combines Multi-Scale Hurst Exponent (`M5` + `H1`), 24-hour Volatility Z-Score/Ratio baselines, and Structural `H4` / 20-Day Macro Trend Gating to halt execution immediately during abnormal volatility shocks or random mid-session chop, while blocking counter-trend longs during macro bear trends (`h4_ema <= -0.20`) and counter-trend shorts during macro bull breakouts (`h4_ema >= +0.65`).
-2. **Institutional Bullion Market-Clock Alpha + ONNX Meta-Labeling (Zero Martingale)**: Exploits structural physical/futures liquidity handoffs in `XAUUSD` across three orthogonal non-overlapping sleeves — **SGE Benchmark Fix Accumulation (`20:45–21:30 -> 02:30 UTC`)**, **COMEX / LBMA PM Fix 6h Exhaustion Reversal (`12:00–15:55 UTC`)**, and **London-Close Settlement Exhaustion (`16:30–19:30 UTC`)** — filtered by Marcos López de Prado's **Two-Stage LightGBM -> ONNX Meta-Labeling Engine**, **Diurnally-Stabilized 24h ATR Swing Barriers**, **Dynamic Quarter-Kelly + Downside Semi-Volatility Targeting**, **Hard Drawdown Circuit Breakers** (`1.5%` Daily DD / `4.0%` Max Trailing DD -> Cooldown Halt -> `0.5x` Probation Recovery), and **Liquidity-Aware TWAP / Iceberg Slicing**.
+1. **Volatility Targeting & Macro-Gated Market Regime Detection**: Combines Multi-Scale Hurst Exponent (`M5` + `H1`), 24-hour Volatility Z-Score/Ratio baselines, and Structural `H4` / 20-Day Macro Trend Gating to halt execution immediately during abnormal volatility shocks or random mid-session chop, while blocking counter-trend longs during macro bear trends (`h4_ema <= -0.20`) and counter-trend shorts during macro bull trends (`h4_ema >= +0.65`).
+2. **Institutional Bullion Market-Clock Alpha + ONNX Meta-Labeling (Zero Martingale)**: Exploits structural physical/futures liquidity handoffs in `XAUUSD` across three statistically significant (`t > 2.20`) orthogonal sleeves — **Shanghai SGE Benchmark Fix Accumulation (`20:45–21:30 -> 02:30 UTC`)**, **COMEX / LBMA PM Fix 6h Exhaustion Reversal (`12:00–15:55 UTC`)**, and **London-Close Settlement Exhaustion (`16:30–19:30 -> 01:30 UTC`)** — filtered by Marcos López de Prado's **Two-Stage LightGBM -> ONNX Meta-Labeling Engine**, **Diurnally-Stabilized 24h ATR Swing Barriers**, **Dynamic Fractional-Kelly (`0.50%–1.00%` risk/trade) + Downside Semi-Volatility Targeting**, **Hard Drawdown Circuit Breakers** (`2.5%` Daily DD / `5.65%` Trailing DD `< 6.0%` -> Cooldown Halt -> `0.5x` Probation Recovery), and **Liquidity-Aware TWAP / Iceberg Slicing**.
 
 ## Directory Structure
 ```text
@@ -27,7 +27,7 @@ Institutional-grade quantitative algorithmic trading architecture engineered aro
 │   └── onnx_inference.py                # Sub-millisecond Calibrated ONNX Runtime Inference Engine
 ├── risk_and_scaling_engine/
 │   ├── position_sizer.py                # Dynamic Fractional Kelly + Vol Target + Inverse ATR/Spread Sizer
-│   ├── circuit_breaker.py               # Equity Curve Control (1.5% Daily / 4.0% Trailing DD)
+│   ├── circuit_breaker.py               # Equity Curve Control (2.5% Daily / 5.65% Trailing DD < 6.0%)
 │   └── liquidity_scaler.py              # Max-Lot Ceiling & TWAP / Iceberg Order Slicer
 ├── backtest_and_validation/
 │   ├── purged_cv.py                     # Purged K-Fold Cross-Validation with Embargo

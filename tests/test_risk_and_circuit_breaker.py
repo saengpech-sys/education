@@ -39,31 +39,30 @@ def test_exact_inverse_volatility_and_kelly_formula(app_cfg):
     cb = EquityCircuitBreaker(app_cfg.risk_and_scaling, initial_equity=100_000.0)
     status = cb.update(100_000.0, datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc))
 
-    # p = 0.70, b = 2.2 -> f* = 0.70 - 0.30 / 2.2 = 0.563636...
-    # quarter kelly = 0.25 * 0.563636 = 0.140909...
-    # utilization = min(1.0, 0.140909 / 0.15) = 0.9393939...
-    # kelly_risk_pct = 0.0025 + 0.9393939 * (0.0050 - 0.0025) = 0.00484848...
-    # realized_annual_vol = 0.05 <= target 0.06 -> vol_scalar = 1.0
+    # p = 0.62, b = 2.2 -> f* = 0.62 - 0.38 / 2.2 = 0.44727272...
+    # 0.30 * f* = 0.13418181... -> utilization = 0.13418181 / 0.15 = 0.89454545...
+    # kelly_risk_pct = 0.0050 + 0.89454545 * (0.0100 - 0.0050) = 0.0094727272...
+    # realized_annual_vol = 0.08 <= target 0.12 -> vol_scalar = 1.0
     # ATR = 2.00 -> sl_dist = 1.5 * 2.00 = 3.00; spread = 0.20 -> spread_cost = 1.25 * 0.20 = 0.25
     # effective_risk_price = 3.25 -> 325 ticks * $1.00 = $325.00 risk per 1.00 lot
-    # risk_usd = 100,000 * 0.0048484848 = $484.84848 -> raw_lots = 484.84848 / 325 = 1.49184 -> floor 0.01 = 1.49
+    # risk_usd = 100,000 * 0.0094727272 = $947.272727 -> raw_lots = 947.272727 / 325 = 2.914685 -> floor 0.01 = 2.91
     res = sizer.calculate_position_size(
         equity=100_000.0,
         side=SignalSide.LONG,
         entry_price=2000.00,
         atr=2.00,
         spread_price=0.20,
-        realized_annual_vol=0.05,
-        win_probability=0.70,
+        realized_annual_vol=0.08,
+        win_probability=0.62,
         reward_to_risk_ratio=2.20,
         circuit_status=status,
     )
 
     assert res.approved is True
-    assert res.kelly_full_fraction == pytest.approx(0.70 - 0.30 / 2.20, rel=1e-9)
-    assert res.effective_risk_pct == pytest.approx(0.0048484848, rel=1e-6)
-    assert res.raw_unrounded_lots == pytest.approx(484.8484848 / 325.0, rel=1e-6)
-    assert res.final_lots == pytest.approx(1.49, abs=1e-9)
+    assert res.kelly_full_fraction == pytest.approx(0.62 - 0.38 / 2.20, rel=1e-9)
+    assert res.effective_risk_pct == pytest.approx(0.00947272727, rel=1e-6)
+    assert res.raw_unrounded_lots == pytest.approx(947.27272727 / 325.0, rel=1e-6)
+    assert res.final_lots == pytest.approx(2.91, abs=1e-9)
     assert res.stop_loss_price == pytest.approx(1997.00, abs=1e-9)
     assert res.take_profit_price == pytest.approx(2006.60, abs=1e-9)
 
@@ -80,7 +79,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
         entry_price=2050.0,
         atr=1.50,
         spread_price=0.16,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.68,
         reward_to_risk_ratio=2.2,
         circuit_status=st,
@@ -91,7 +90,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
         entry_price=2050.0,
         atr=3.00,  # 2x ATR
         spread_price=0.16,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.68,
         reward_to_risk_ratio=2.2,
         circuit_status=st,
@@ -102,7 +101,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
         entry_price=2050.0,
         atr=1.50,
         spread_price=0.80,  # 5x wider spread
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.68,
         reward_to_risk_ratio=2.2,
         circuit_status=st,
@@ -113,7 +112,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
         entry_price=2050.0,
         atr=1.50,
         spread_price=0.16,
-        realized_annual_vol=0.12,  # 2x target annual vol (6%) -> vol_scalar = 0.50
+        realized_annual_vol=0.24,  # 2x target annual vol (12%) -> vol_scalar = 0.50
         win_probability=0.68,
         reward_to_risk_ratio=2.2,
         circuit_status=st,
@@ -123,14 +122,14 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
     assert wide_spread.raw_unrounded_lots < base.raw_unrounded_lots
     assert high_port_vol.raw_unrounded_lots == pytest.approx(0.5 * base.raw_unrounded_lots, rel=1e-9)
 
-    # Zero-Martingale check: even at p = 0.99, effective_risk_pct never exceeds max_risk_per_trade_pct (0.50%)
+    # Zero-Martingale check: even at p = 0.99, effective_risk_pct never exceeds max_risk_per_trade_pct (1.00%)
     extreme_conf = sizer.calculate_position_size(
         equity=250_000.0,
         side=SignalSide.LONG,
         entry_price=2050.0,
         atr=1.50,
         spread_price=0.16,
-        realized_annual_vol=0.04,
+        realized_annual_vol=0.06,
         win_probability=0.99,
         reward_to_risk_ratio=3.0,
         circuit_status=st,
@@ -144,7 +143,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
         entry_price=2050.0,
         atr=1.50,
         spread_price=0.16,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.25,
         reward_to_risk_ratio=2.0,
         circuit_status=st,
@@ -154,12 +153,12 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
 
     # Micro account where even 0.01 lot exceeds risk budget must be rejected rather than over-leveraging
     tiny_acc = sizer.calculate_position_size(
-        equity=200.0,
+        equity=100.0,
         side=SignalSide.LONG,
         entry_price=2050.0,
         atr=5.00,
         spread_price=0.30,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.70,
         reward_to_risk_ratio=2.2,
         circuit_status=st,
@@ -171,7 +170,7 @@ def test_inverse_scaling_with_atr_spread_vol_and_zero_martingale(app_cfg):
 def test_circuit_breaker_daily_1_5_pct_cooldown_and_half_lot_recovery(app_cfg):
     """
     Verify Equity Curve Control:
-    1. Daily DD > 1.5% -> Immediate COOLDOWN_HALT (0 lots).
+    1. Daily DD > daily_drawdown_limit_pct (2.5%) -> Immediate COOLDOWN_HALT (0 lots).
     2. Remains halted during cooldown or while market regime is ABNORMAL_VOLATILITY.
     3. Transitions to RECOVERY_HALF_RISK (0.5x lot size) once cooldown expires & market calms.
     4. Restores NORMAL (1.0x lot size) once equity heals within recovery buffer.
@@ -183,31 +182,31 @@ def test_circuit_breaker_daily_1_5_pct_cooldown_and_half_lot_recovery(app_cfg):
     st_norm = cb.update(100_000.0, t0, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.2)
     assert st_norm.state == CircuitBreakerState.NORMAL
     norm_size = sizer.calculate_position_size(
-        equity=98_300.0,
+        equity=97_300.0,
         side=SignalSide.LONG,
         entry_price=2000.0,
         atr=2.0,
         spread_price=0.15,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.72,
         reward_to_risk_ratio=2.2,
         circuit_status=st_norm,
     )
 
-    # Drop 1.70% intraday ($100,000 -> $98,300) > 1.5% limit -> COOLDOWN_HALT
+    # Drop 2.70% intraday ($100,000 -> $97,300) > 2.5% limit -> COOLDOWN_HALT
     t1 = t0 + timedelta(minutes=30)
-    st_halt = cb.update(98_300.0, t1, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.4)
+    st_halt = cb.update(97_300.0, t1, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.4)
     assert st_halt.state == CircuitBreakerState.COOLDOWN_HALT
     assert st_halt.allow_new_trades is False
     assert st_halt.lot_multiplier == 0.0
 
     blocked_size = sizer.calculate_position_size(
-        equity=98_300.0,
+        equity=97_300.0,
         side=SignalSide.LONG,
         entry_price=2000.0,
         atr=2.0,
         spread_price=0.15,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.72,
         reward_to_risk_ratio=2.2,
         circuit_status=st_halt,
@@ -217,24 +216,24 @@ def test_circuit_breaker_daily_1_5_pct_cooldown_and_half_lot_recovery(app_cfg):
 
     # Cooldown timer elapsed (245m > 240m), BUT market is in ABNORMAL_VOLATILITY -> stay halted!
     t2 = t1 + timedelta(minutes=245)
-    st_still_turb = cb.update(98_300.0, t2, regime=MarketRegime.ABNORMAL_VOLATILITY, vol_zscore=3.1)
+    st_still_turb = cb.update(97_300.0, t2, regime=MarketRegime.ABNORMAL_VOLATILITY, vol_zscore=3.1)
     assert st_still_turb.state == CircuitBreakerState.COOLDOWN_HALT
     assert st_still_turb.allow_new_trades is False
 
     # Market regime returns to normal -> enters RECOVERY_HALF_RISK (lot_multiplier = 0.50)
     t3 = t2 + timedelta(minutes=10)
-    st_rec = cb.update(98_300.0, t3, regime=MarketRegime.MEAN_REVERTING, vol_zscore=0.3)
+    st_rec = cb.update(97_300.0, t3, regime=MarketRegime.MEAN_REVERTING, vol_zscore=0.3)
     assert st_rec.state == CircuitBreakerState.RECOVERY_HALF_RISK
     assert st_rec.allow_new_trades is True
     assert st_rec.lot_multiplier == pytest.approx(0.50)
 
     rec_size = sizer.calculate_position_size(
-        equity=98_300.0,
+        equity=97_300.0,
         side=SignalSide.LONG,
         entry_price=2000.0,
         atr=2.0,
         spread_price=0.15,
-        realized_annual_vol=0.05,
+        realized_annual_vol=0.08,
         win_probability=0.72,
         reward_to_risk_ratio=2.2,
         circuit_status=st_rec,
@@ -243,15 +242,15 @@ def test_circuit_breaker_daily_1_5_pct_cooldown_and_half_lot_recovery(app_cfg):
     assert rec_size.raw_unrounded_lots == pytest.approx(0.50 * norm_size.raw_unrounded_lots, rel=1e-9)
     assert rec_size.final_lots == quantize_lots_down(0.50 * norm_size.raw_unrounded_lots, 0.01)
 
-    # Equity recovers to $99,500 (daily & trailing DD = 0.5% <= 0.8% buffer) -> back to NORMAL 1.0x
+    # Equity recovers to $99,200 (daily & trailing DD = 0.8% <= 1.2% buffer) -> back to NORMAL 1.0x
     t4 = t3 + timedelta(minutes=60)
-    st_healed = cb.update(99_500.0, t4, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.2)
+    st_healed = cb.update(99_200.0, t4, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.2)
     assert st_healed.state == CircuitBreakerState.NORMAL
     assert st_healed.lot_multiplier == pytest.approx(1.0)
 
 
 def test_trailing_drawdown_4_pct_and_6_pct_hard_lock(app_cfg):
-    """Verify multi-day 4.0% Trailing DD Cooldown and 6.0% Emergency Hard Lock."""
+    """Verify multi-day Trailing DD Cooldown (5.6% < 6.0% mandate) and 8.5% Emergency Hard Lock."""
     cb = EquityCircuitBreaker(app_cfg.risk_and_scaling, initial_equity=100_000.0)
     day1 = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
 
@@ -259,19 +258,18 @@ def test_trailing_drawdown_4_pct_and_6_pct_hard_lock(app_cfg):
     cb.update(120_000.0, day1, regime=MarketRegime.TRENDING_BULL, vol_zscore=0.1)
     assert cb.peak_equity == pytest.approx(120_000.0)
 
-    # Over multiple days (each daily drop < 1.5%), cumulative drop reaches 4.25% ($114,900)
+    # Over multiple days (each daily drop < 2.5%), cumulative drop reaches 6.0% ($112,800) > 5.6% limit
     day2 = day1 + timedelta(days=1)
-    cb.update(118_500.0, day2, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
+    cb.update(117_600.0, day2, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
     day3 = day2 + timedelta(days=1)
-    cb.update(116_800.0, day3, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
+    cb.update(115_200.0, day3, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
     day4 = day3 + timedelta(days=1)
-    st_trail = cb.update(114_900.0, day4, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
-    # Intraday DD on day4 is < 1.7%, check trailing DD = (120,000 - 114,900)/120,000 = 4.25% > 4.0%
-    assert st_trail.trailing_drawdown_pct == pytest.approx(0.0425)
+    st_trail = cb.update(112_800.0, day4, regime=MarketRegime.TRENDING_BEAR, vol_zscore=0.2)
+    assert st_trail.trailing_drawdown_pct == pytest.approx(0.0600)
     assert st_trail.state == CircuitBreakerState.COOLDOWN_HALT
 
-    # Drop to $112,500 (6.25% trailing DD >= 6.0% hard lock)
-    st_lock = cb.update(112_500.0, day4 + timedelta(hours=5), regime=MarketRegime.MEAN_REVERTING, vol_zscore=0.1)
+    # Drop to $109,500 (8.75% trailing DD >= 8.5% hard lock)
+    st_lock = cb.update(109_500.0, day4 + timedelta(hours=5), regime=MarketRegime.MEAN_REVERTING, vol_zscore=0.1)
     assert st_lock.state == CircuitBreakerState.HARD_LOCK
     assert st_lock.allow_new_trades is False
 

@@ -132,6 +132,7 @@ class WalkForwardOptimizer:
         retrain_every_bars: Optional[int] = None,
         max_concurrent_sleeves: int = 3,
         sleeve_cooldown_bars: int = 36,
+        same_side_risk_scale: float = 1.0,
     ) -> WalkForwardResult:
         """Run rolling Walk-Forward Optimization and stitch compounded Out-Of-Sample equity."""
         bt_cfg = self._cfg.backtest_and_validation
@@ -178,8 +179,8 @@ class WalkForwardOptimizer:
         all_spreads_px = all_spreads_pts * spec.point
         all_times = aligned_df["close_time"].tolist()
 
-        # Active portfolio positions: (global_exit_idx, sleeve_id, net_pnl, trade_record_dict)
-        open_positions: List[tuple[int, int, float, Dict[str, object]]] = []
+        # Active portfolio positions: (global_exit_idx, sleeve_id, side_int, net_pnl, trade_record_dict)
+        open_positions: List[tuple[int, int, int, float, Dict[str, object]]] = []
         last_sleeve_entry_global: Dict[int, int] = {}
 
         ann_factor = np.sqrt(float(self._cfg.data_pipeline.annualization_bars_m5))
@@ -236,14 +237,14 @@ class WalkForwardOptimizer:
                 prev_equity = equity
 
                 # Settle any closed sleeve trades strictly at their chronological exit timestamp
-                still_open: List[tuple[int, int, float, Dict[str, object]]] = []
-                for exit_g_idx, slv_open, pnl_open, tr_dict in open_positions:
+                still_open: List[tuple[int, int, int, float, Dict[str, object]]] = []
+                for exit_g_idx, slv_open, side_open, pnl_open, tr_dict in open_positions:
                     if global_i >= exit_g_idx:
                         equity += pnl_open
                         tr_dict["equity_after"] = round(equity, 2)
                         trade_records.append(tr_dict)
                     else:
-                        still_open.append((exit_g_idx, slv_open, pnl_open, tr_dict))
+                        still_open.append((exit_g_idx, slv_open, side_open, pnl_open, tr_dict))
                 open_positions = still_open
 
                 regime_i = MarketRegime(regimes.iloc[i])
@@ -262,43 +263,58 @@ class WalkForwardOptimizer:
                 else:
                     realized_port_vol = 0.65 * rk_cfg.target_annual_volatility
 
-                # Smooth pre-circuit-breaker portfolio drawdown risk taper above 2.0% trailing DD
-                if cb_status.trailing_drawdown_pct > 0.020:
-                    stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - 0.020)
+                # Smooth pre-circuit-breaker portfolio drawdown risk taper & high-DD overlap shield
+                dd_taper_start = 0.45 * rk_cfg.max_trailing_drawdown_limit_pct
+                dd_overlap_cap = 0.72 * rk_cfg.max_trailing_drawdown_limit_pct
+                if cb_status.trailing_drawdown_pct > dd_taper_start:
+                    stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - dd_taper_start)
                     realized_port_vol = max(
                         realized_port_vol,
                         rk_cfg.target_annual_volatility * stress_mult,
                     )
 
                 slv_id = int(sleeve_ids[i])
-                active_sleeve_set = {s_open for _, s_open, _, _ in open_positions}
+                side_int = int(sides[i])
+                active_sleeve_set = {s_open for _, s_open, _, _, _ in open_positions}
+                same_side_open_count = sum(1 for _, _, sd_open, _, _ in open_positions if sd_open == side_int)
                 last_g_entry = last_sleeve_entry_global.get(slv_id, -999999)
+                allow_same_side = (same_side_open_count == 0) or (
+                    same_side_risk_scale > 0.0
+                    and same_side_open_count == 1
+                    and cb_status.trailing_drawdown_pct <= dd_overlap_cap
+                )
 
                 if (
                     global_i < n_total - 5
-                    and sides[i] != 0
+                    and side_int != 0
                     and slv_id > 0
                     and slv_id not in active_sleeve_set
+                    and allow_same_side
                     and (global_i - last_g_entry) >= sleeve_cooldown_bars
                     and len(open_positions) < max_concurrent_sleeves
                     and all_spreads_pts[global_i] <= self._cfg.execution_and_monitoring.max_spread_points
                 ):
                     spread_px = float(all_spreads_px[global_i])
                     slip_px = bt_cfg.slippage_points * spec.point
-                    side_int = int(sides[i])
                     side_enum = SignalSide(side_int)
                     entry_ref = (
                         all_closes[global_i] + 0.5 * spread_px + slip_px
                         if side_enum == SignalSide.LONG
                         else all_closes[global_i] - 0.5 * spread_px - slip_px
                     )
+                    effective_vol = realized_port_vol
+                    if same_side_open_count == 1 and 0.0 < same_side_risk_scale < 1.0:
+                        effective_vol = max(
+                            realized_port_vol / same_side_risk_scale,
+                            rk_cfg.target_annual_volatility / same_side_risk_scale,
+                        )
                     size_res = sizer.calculate_position_size(
                         equity=equity,
                         side=side_enum,
                         entry_price=entry_ref,
                         atr=float(all_atrs[global_i]),
                         spread_price=spread_px,
-                        realized_annual_vol=realized_port_vol,
+                        realized_annual_vol=effective_vol,
                         win_probability=float(meta_probs[i]),
                         reward_to_risk_ratio=engine.reward_to_risk_ratio,
                         circuit_status=cb_status,
@@ -345,7 +361,7 @@ class WalkForwardOptimizer:
                             "net_pnl_usd": round(net_pnl, 2),
                             "equity_after": round(equity + net_pnl, 2),
                         }
-                        open_positions.append((exit_g_idx, slv_id, net_pnl, tr_record))
+                        open_positions.append((exit_g_idx, slv_id, side_int, net_pnl, tr_record))
                         last_sleeve_entry_global[slv_id] = global_i
                         fold_trades += 1
 
@@ -371,7 +387,7 @@ class WalkForwardOptimizer:
 
         # Settle any remaining open positions landing on the terminal bar of the dataset
         if open_positions and oos_equities:
-            for _, _, pnl_open, tr_dict in open_positions:
+            for _, _, _, pnl_open, tr_dict in open_positions:
                 equity += pnl_open
                 tr_dict["equity_after"] = round(equity, 2)
                 trade_records.append(tr_dict)

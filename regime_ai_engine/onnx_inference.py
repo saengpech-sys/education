@@ -88,7 +88,7 @@ class ONNXMetaLabelingEngine:
         probs = self._meta_sess.run(["probabilities"], {self._meta_input_name: arr})[0]
         raw_p = np.asarray(probs[:, 1], dtype=np.float64)
         # Smooth Kelly calibration mapping regularized tree probabilities into calibrated expectancy space
-        return np.clip(0.58 + 1.35 * (raw_p - 0.45), 0.05, 0.88)
+        return np.clip(0.60 + 1.45 * (raw_p - 0.45), 0.05, 0.88)
 
     def evaluate_snapshot(self, snapshot: MarketSnapshot) -> AISignalDecision:
         """Run full Regime + Primary ONNX + Meta ONNX inference on a single live MarketSnapshot."""

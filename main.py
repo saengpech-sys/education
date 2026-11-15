@@ -147,11 +147,16 @@ class TradingSystemOrchestrator:
             return None
 
         entry_px = live_tick.ask if ai_decision.primary_side == SignalSide.LONG else live_tick.bid
+        rk_cfg = self._cfg.risk_and_scaling
         port_vol_proxy = (
             0.75
-            * self._cfg.risk_and_scaling.target_annual_volatility
+            * rk_cfg.target_annual_volatility
             * min(2.5, max(0.6, snapshot.vol_ratio))
         )
+        dd_taper_start = 0.45 * rk_cfg.max_trailing_drawdown_limit_pct
+        if cb_status.trailing_drawdown_pct > dd_taper_start:
+            stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - dd_taper_start)
+            port_vol_proxy = max(port_vol_proxy, rk_cfg.target_annual_volatility * stress_mult)
         size_res = self._sizer.calculate_position_size(
             equity=account.equity,
             side=ai_decision.primary_side,
