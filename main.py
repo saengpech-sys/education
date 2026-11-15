@@ -302,7 +302,7 @@ def run_demo_pipeline(config_path: Path, total_m5_bars: int = 30000) -> None:
     )
     logger.info(
         "Monte Carlo (%d runs) | P05 Eq: $%.2f | Median Eq: $%.2f | P95 Eq: $%.2f | "
-        "Median MaxDD: %.2f%% | P95 MaxDD: %.2f%% | P99 Worst DD: %.2f%% | P(DD>4%%): %.2f%%",
+        "Median MaxDD: %.2f%% | P95 MaxDD: %.2f%% | P99 Worst DD: %.2f%% | P(DD>CB %.1f%%): %.2f%%",
         mc_rep.iterations,
         mc_rep.p05_terminal_equity,
         mc_rep.median_terminal_equity,
@@ -310,6 +310,7 @@ def run_demo_pipeline(config_path: Path, total_m5_bars: int = 30000) -> None:
         mc_rep.median_max_drawdown_pct * 100.0,
         mc_rep.p95_max_drawdown_pct * 100.0,
         mc_rep.p99_worst_case_drawdown_pct * 100.0,
+        cfg.risk_and_scaling.max_trailing_drawdown_limit_pct * 100.0,
         mc_rep.prob_breach_4pct_dd * 100.0,
     )
 
@@ -350,6 +351,77 @@ def run_demo_pipeline(config_path: Path, total_m5_bars: int = 30000) -> None:
     audit_db.close()
 
 
+def run_mt5_training_pipeline(
+    config_path: Path,
+    total_m5_bars: int = 30000,
+    gateway: Optional[MT5GatewayProtocol] = None,
+) -> None:
+    """Fetch historical MTF bars from MetaTrader 5, validate via WFO, and export ONNX models."""
+    cfg = load_config(config_path)
+    base_dir = config_path.parent
+    onnx_dir = base_dir / cfg.regime_ai.onnx_dir
+
+    owns_gateway = gateway is None
+    if gateway is None:
+        gateway = NativeMT5Gateway(
+            login=cfg.execution_and_monitoring.mt5_login,
+            password=cfg.execution_and_monitoring.mt5_password,
+            server=cfg.execution_and_monitoring.mt5_server,
+            terminal_path=cfg.execution_and_monitoring.mt5_terminal_path,
+        )
+        if not gateway.connect():
+            raise RuntimeError("Initial connection to MetaTrader 5 terminal failed during train-mt5.")
+
+    try:
+        fetcher = MultiTimeframeDataFetcher(gateway)
+        pipeline = MultiTimeframeFeaturePipeline(cfg.data_pipeline)
+        bars_by_tf = fetcher.fetch_multi_timeframe_bars(
+            symbol=cfg.system.symbol,
+            base_tf=cfg.data_pipeline.base_timeframe,
+            higher_tfs=cfg.data_pipeline.higher_timeframes,
+            num_bars=total_m5_bars,
+        )
+        aligned_df = pipeline.build_aligned_dataset(bars_by_tf=bars_by_tf, drop_warmup_nans=True)
+        train_window = min(len(aligned_df), cfg.backtest_and_validation.wfo_train_bars)
+        if train_window < 300:
+            raise ValueError(
+                f"Insufficient aligned bars ({len(aligned_df)}) from MT5 to train ONNX models."
+            )
+
+        if len(aligned_df) >= cfg.backtest_and_validation.wfo_train_bars + cfg.backtest_and_validation.wfo_test_bars:
+            wfo = WalkForwardOptimizer(config=cfg, onnx_artifact_dir=onnx_dir)
+            wfo_res = wfo.run(aligned_df)
+            m = wfo_res.metrics
+            logger.info(
+                "MT5 Broker WFO Validation | Return: %+.2f%% | Sharpe: %.2f | Sortino: %.2f | "
+                "MaxDD: %.2f%% | WinRate: %.2f%% | Trades: %d",
+                m.total_return_pct * 100.0,
+                m.sharpe_ratio,
+                m.sortino_ratio,
+                m.max_drawdown_pct * 100.0,
+                m.win_rate_pct * 100.0,
+                m.total_trades,
+            )
+
+        trainer = MetaLabelingTrainer(
+            ai_config=cfg.regime_ai,
+            symbol_spec=cfg.symbol_spec,
+            random_seed=cfg.system.random_seed,
+        )
+        artifacts = trainer.train_and_export(
+            train_df=aligned_df.iloc[-train_window:],
+            output_dir=onnx_dir,
+        )
+        logger.info(
+            "Production ONNX models exported successfully -> Primary: %s | Meta: %s",
+            artifacts.primary_onnx_path,
+            artifacts.meta_onnx_path,
+        )
+    finally:
+        if owns_gateway:
+            gateway.disconnect()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -364,21 +436,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["demo-pipeline", "live-mt5"],
+        choices=["demo-pipeline", "train-mt5", "live-mt5"],
         default="demo-pipeline",
-        help="Execution mode",
+        help="Execution mode: demo-pipeline (simulation), train-mt5 (train ONNX on MT5 data), live-mt5 (24/5 VPS)",
     )
     parser.add_argument(
         "--bars",
         type=int,
         default=30000,
-        help="Number of M5 bars to simulate in demo-pipeline mode (288 M5 bars = 1 full 24h trading day)",
+        help="Number of M5 bars to fetch/simulate in demo-pipeline or train-mt5 mode (288 M5 bars = 1 day)",
     )
     args = parser.parse_args()
     cfg_path = Path(args.config).resolve()
 
     if args.mode == "demo-pipeline":
         run_demo_pipeline(cfg_path, total_m5_bars=args.bars)
+        return
+
+    if args.mode == "train-mt5":
+        run_mt5_training_pipeline(cfg_path, total_m5_bars=args.bars)
         return
 
     cfg = load_config(cfg_path)

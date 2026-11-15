@@ -265,3 +265,26 @@ def test_mt5_executor_retry_reconnect_guards_and_sqlite_feedback_loop(app_cfg, t
     assert cal.closed_trades_count == 1
     assert cal.realized_win_rate == pytest.approx(1.0)
     db.close()
+
+
+def test_train_mt5_pipeline_exports_onnx(app_cfg, tmp_path: Path) -> None:
+    """Verify --mode train-mt5 pipeline exports primary and meta ONNX models cleanly."""
+    import shutil
+    from main import run_mt5_training_pipeline
+
+    cfg_src = Path(__file__).resolve().parents[1] / "config.yaml"
+    cfg_copy = tmp_path / "config.yaml"
+    shutil.copy2(cfg_src, cfg_copy)
+
+    gw = SimulatedMT5Gateway(
+        symbol_spec=app_cfg.symbol_spec,
+        initial_equity=100_000.0,
+        total_m5_bars=4500,
+        seed=42,
+    )
+    run_mt5_training_pipeline(config_path=cfg_copy, total_m5_bars=4500, gateway=gw)
+
+    onnx_dir = tmp_path / app_cfg.regime_ai.onnx_dir
+    assert (onnx_dir / app_cfg.regime_ai.primary_onnx_filename).exists()
+    assert (onnx_dir / app_cfg.regime_ai.meta_onnx_filename).exists()
+
