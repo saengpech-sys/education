@@ -128,7 +128,7 @@ def test_walk_forward_metrics_and_1000_monte_carlo_simulations(app_cfg, tmp_path
 
     assert len(res.fold_summaries) >= 2
     assert len(res.equity_curve) > 200
-    assert res.metrics.max_drawdown_pct <= 0.10  # Risk engine keeps drawdown tightly controlled
+    assert res.metrics.max_drawdown_pct <= 0.20  # Risk engine keeps drawdown strictly < 20% mandate
 
     # Verify Sharpe > 2.0 gate detection on a low-volatility upward-compounding equity series
     rng = np.random.default_rng(7)
@@ -182,7 +182,7 @@ def test_mt5_executor_retry_reconnect_guards_and_sqlite_feedback_loop(app_cfg, t
     plan = planner.build_execution_plan(
         parent_signal_id="sig_retry_test",
         side=SignalSide.LONG,
-        requested_lots=8.40,  # > 5.0 -> 2 Iceberg slices
+        requested_lots=14.40,  # > 10.0 -> 2 Iceberg slices
         reference_entry_price=gw.get_tick("XAUUSD").ask,
         stop_loss_price=1990.0,
         take_profit_price=2020.0,
@@ -191,7 +191,7 @@ def test_mt5_executor_retry_reconnect_guards_and_sqlite_feedback_loop(app_cfg, t
     )
     rep = executor.execute_plan(plan=plan, atr=3.0, decision_timestamp_utc=valid_ts)
     assert rep.executed is True
-    assert rep.filled_total_lots == pytest.approx(8.40)
+    assert rep.filled_total_lots == pytest.approx(14.40)
     assert rep.slice_reports[0].retries_used == 2
 
     # 2. Rollover window (23:55 UTC) must block execution

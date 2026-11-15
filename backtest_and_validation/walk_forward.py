@@ -81,7 +81,16 @@ class WalkForwardOptimizer:
             meta_model_source=meta_bytes,
             confidence_threshold_override=0.36,
         )
-        sides_base, slv_base, hold_bars, _, meta_probs, regimes = base_engine.evaluate_batch_with_sleeves(val_df)
+        (
+            sides_base,
+            slv_base,
+            hold_bars,
+            pt_mults,
+            use_chand,
+            _,
+            meta_probs,
+            regimes,
+        ) = base_engine.evaluate_batch_with_barriers(val_df)
 
         # De-cluster consecutive M5 candidate bars per sleeve to match live execution
         eval_sides = np.zeros_like(sides_base)
@@ -101,6 +110,8 @@ class WalkForwardOptimizer:
             point=self._cfg.symbol_spec.point,
             slippage_points=self._cfg.backtest_and_validation.slippage_points,
             max_holding_bars_arr=hold_bars,
+            pt_atr_mult_arr=pt_mults,
+            enable_ratchet_arr=use_chand,
             commission_per_lot_usd=self._cfg.backtest_and_validation.commission_per_lot_usd,
             contract_size=self._cfg.symbol_spec.contract_size,
             enable_ratchet=False,
@@ -132,7 +143,7 @@ class WalkForwardOptimizer:
         retrain_every_bars: Optional[int] = None,
         max_concurrent_sleeves: int = 3,
         sleeve_cooldown_bars: int = 36,
-        same_side_risk_scale: float = 1.0,
+        same_side_risk_scale: float = 0.70,
     ) -> WalkForwardResult:
         """Run rolling Walk-Forward Optimization and stitch compounded Out-Of-Sample equity."""
         bt_cfg = self._cfg.backtest_and_validation
@@ -220,9 +231,16 @@ class WalkForwardOptimizer:
                 confidence_threshold_override=chosen_thr,
             )
 
-            sides, sleeve_ids, hold_bars, _, meta_probs, regimes = engine.evaluate_batch_with_sleeves(
-                test_slice
-            )
+            (
+                sides,
+                sleeve_ids,
+                hold_bars,
+                pt_mults,
+                use_chand,
+                _,
+                meta_probs,
+                regimes,
+            ) = engine.evaluate_batch_with_barriers(test_slice)
             fold_start_eq = equity
             fold_trades = 0
 
@@ -263,11 +281,15 @@ class WalkForwardOptimizer:
                 else:
                     realized_port_vol = 0.65 * rk_cfg.target_annual_volatility
 
-                # Smooth pre-circuit-breaker portfolio drawdown risk taper & high-DD overlap shield
+                # Dimensionless pre-circuit-breaker portfolio drawdown risk taper & high-DD overlap shield
                 dd_taper_start = 0.45 * rk_cfg.max_trailing_drawdown_limit_pct
-                dd_overlap_cap = 0.72 * rk_cfg.max_trailing_drawdown_limit_pct
+                dd_overlap_cap = 0.65 * rk_cfg.max_trailing_drawdown_limit_pct
                 if cb_status.trailing_drawdown_pct > dd_taper_start:
-                    stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - dd_taper_start)
+                    excess_frac = (cb_status.trailing_drawdown_pct - dd_taper_start) / max(
+                        rk_cfg.max_trailing_drawdown_limit_pct - dd_taper_start,
+                        1e-6,
+                    )
+                    stress_mult = 1.0 + 1.25 * excess_frac
                     realized_port_vol = max(
                         realized_port_vol,
                         rk_cfg.target_annual_volatility * stress_mult,
@@ -308,6 +330,8 @@ class WalkForwardOptimizer:
                             realized_port_vol / same_side_risk_scale,
                             rk_cfg.target_annual_volatility / same_side_risk_scale,
                         )
+                    is_runner = bool(use_chand[i])
+                    rr_for_kelly = 2.60 if is_runner else engine.reward_to_risk_ratio
                     size_res = sizer.calculate_position_size(
                         equity=equity,
                         side=side_enum,
@@ -316,7 +340,7 @@ class WalkForwardOptimizer:
                         spread_price=spread_px,
                         realized_annual_vol=effective_vol,
                         win_probability=float(meta_probs[i]),
-                        reward_to_risk_ratio=engine.reward_to_risk_ratio,
+                        reward_to_risk_ratio=rr_for_kelly,
                         circuit_status=cb_status,
                     )
                     if size_res.approved and size_res.final_lots >= spec.volume_min:
@@ -329,11 +353,15 @@ class WalkForwardOptimizer:
                             atrs=all_atrs,
                             spreads_price=all_spreads_px,
                             sl_atr_mult=rk_cfg.atr_stop_multiplier,
-                            pt_atr_mult=rk_cfg.atr_tp_multiplier,
+                            pt_atr_mult=float(pt_mults[i]),
                             max_holding_bars=int(hold_bars[i]),
                             point=spec.point,
                             slippage_price=slip_px,
-                            enable_ratchet=False,
+                            enable_ratchet=is_runner,
+                            be_trigger_r=1.55,
+                            be_offset_r=0.25,
+                            trail_trigger_r=1.95,
+                            trail_atr_mult=1.50,
                         )
 
                         price_diff = (
@@ -348,6 +376,7 @@ class WalkForwardOptimizer:
                         tr_record: Dict[str, object] = {
                             "fold": fold_idx,
                             "sleeve": slv_id,
+                            "trend_runner": is_runner,
                             "entry_time": ts,
                             "exit_time": all_times[exit_g_idx],
                             "side": side_enum.name,

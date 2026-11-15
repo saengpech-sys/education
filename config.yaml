@@ -59,24 +59,24 @@ regime_ai:
 
 risk_and_scaling:
   # Dynamic Fractional Kelly & Volatility Targeting (First Principle #2: Zero Martingale)
-  min_risk_per_trade_pct: 0.0050       # 0.50% floor when trade passes meta-filter
-  max_risk_per_trade_pct: 0.0100       # 1.00% hard cap per trade (strictly no Martingale)
-  kelly_fraction: 0.30                 # Balanced Fractional-Kelly geometric compounding
-  target_annual_volatility: 0.12       # 12.0% annualized portfolio vol target
+  min_risk_per_trade_pct: 0.0240       # 2.40% floor when trade passes ONNX meta-filter
+  max_risk_per_trade_pct: 0.0350       # 3.50% hard cap per trade (Zero Martingale, 2.0%-3.5% mandate)
+  kelly_fraction: 0.35                 # High-growth Fractional-Kelly geometric compounding
+  target_annual_volatility: 0.38       # 38.0% annualized downside semi-volatility target
   atr_stop_multiplier: 1.50
-  atr_tp_multiplier: 3.30              # 2.2R asymmetric reward-to-risk
+  atr_tp_multiplier: 3.30              # 2.2R base barrier; 4.0R (6.0 ATR) + 1.5 ATR Chandelier in trend-runner mode
   spread_risk_weight: 1.25             # Penalizes wide spreads in position sizing denominator
-  # Equity Curve Control & Hard Drawdown Circuit Breaker (< 6.0% MaxDD Mandate with Overlap Shield)
-  daily_drawdown_limit_pct: 0.025      # 2.5% Daily Drawdown -> Cooldown Halt
-  max_trailing_drawdown_limit_pct: 0.0565 # 5.65% Max Trailing Drawdown -> Cooldown Halt (< 6.0% ceiling)
-  hard_lock_drawdown_limit_pct: 0.085  # 8.5% Emergency Hard Lock
+  # Equity Curve Control & Hard Drawdown Circuit Breaker (< 18%-20% MaxDD Mandate with Overlap Shield)
+  daily_drawdown_limit_pct: 0.075      # 7.5% Daily Drawdown -> Cooldown Halt
+  max_trailing_drawdown_limit_pct: 0.170 # 17.0% Max Trailing Drawdown -> Cooldown Halt (< 20% ceiling)
+  hard_lock_drawdown_limit_pct: 0.230  # 23.0% Catastrophic Emergency Hard Lock
   cooldown_minutes: 240                # Minimum halt duration before entering 0.5x recovery
   recovery_lot_multiplier: 0.50        # Half lot size during post-cooldown probation
   recovery_vol_zscore_max: 1.00        # Market vol z-score required to exit cooldown/probation
-  recovery_drawdown_buffer_pct: 0.012  # Equity recovery buffer to restore 1.0x sizing
+  recovery_drawdown_buffer_pct: 0.035  # Equity recovery buffer to restore 1.0x sizing
   # Liquidity-Aware Scaling (TWAP / Iceberg)
-  max_lot_per_order: 5.00              # Maximum child order size sent to broker at once
-  max_total_lot_per_signal: 50.00      # Maximum aggregate parent order exposure
+  max_lot_per_order: 10.00             # Maximum child order size sent to broker at once
+  max_total_lot_per_signal: 100.00     # Maximum aggregate parent order exposure
   max_liquidity_participation_rate: 0.05
   twap_slice_interval_seconds: 1.50
   iceberg_jitter_pct: 0.12             # Randomized slice sizing within volume_step to mask footprint

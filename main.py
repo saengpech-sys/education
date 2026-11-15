@@ -155,7 +155,11 @@ class TradingSystemOrchestrator:
         )
         dd_taper_start = 0.45 * rk_cfg.max_trailing_drawdown_limit_pct
         if cb_status.trailing_drawdown_pct > dd_taper_start:
-            stress_mult = 1.0 + 30.0 * (cb_status.trailing_drawdown_pct - dd_taper_start)
+            excess_frac = (cb_status.trailing_drawdown_pct - dd_taper_start) / max(
+                rk_cfg.max_trailing_drawdown_limit_pct - dd_taper_start,
+                1e-6,
+            )
+            stress_mult = 1.0 + 1.25 * excess_frac
             port_vol_proxy = max(port_vol_proxy, rk_cfg.target_annual_volatility * stress_mult)
         size_res = self._sizer.calculate_position_size(
             equity=account.equity,

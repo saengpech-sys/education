@@ -77,19 +77,27 @@ def _export_lgbm_to_onnx_bytes(model: lgb.LGBMClassifier, num_features: int) -> 
     return onnx_model.SerializeToString()
 
 
-def extract_institutional_sleeve_signals(
+def extract_sleeve_barrier_schedule(
     X_primary: np.ndarray,
     regime_codes: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h4_trend_runner_threshold: float = 0.50,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Extract strictly causal Institutional Bullion Market-Clock candidate signals:
-      - Sleeve 1 (ID=1, Hold=66 bars / 5.5h): NY COMEX Close -> Shanghai SGE AM Fix Accumulation LONG
-      - Sleeve 2 (ID=2, Hold=156 bars / 13.0h): COMEX / LBMA PM Fix Handoff 6h Exhaustion LONG & SHORT
-      - Sleeve 3 (ID=3, Hold=84 bars / 7.0h): London Close / COMEX Settlement Selloff Exhaustion LONG
+    Extract strictly causal 4-Sleeve Institutional Bullion Market-Clock & Breakout candidate signals
+    with Regime-Adaptive Chandelier Trailing-Stop barrier schedules:
+      - Sleeve 1 (ID=1): NY COMEX Close -> Shanghai SGE AM Fix Accumulation LONG
+        * Hold=66 bars (5.5h -> 02:30 UTC), Fixed TP=3.30 ATR (2.2R), Ratchet=False
+      - Sleeve 2 (ID=2): COMEX / LBMA PM Fix Handoff 6h Exhaustion LONG & SHORT
+        * Hold=156 bars (13.0h), Fixed TP=3.30 ATR (2.2R), Ratchet=False (Shorts gated at h4_ema < 0.30)
+      - Sleeve 3 (ID=3): London Close / COMEX Settlement Selloff Exhaustion LONG
+        * Range/Mild (`h4_ema < 0.50`): Hold=84 bars (7.0h), Fixed TP=3.30 ATR (2.2R)
+        * Macro Bull (`h4_ema >= 0.50`): Hold=108 bars (9.0h), Chandelier Runner TP=6.00 ATR (4.0R)
+      - Sleeve 4 (ID=4): Post-LBMA PM Fix (15:00-16:25 UTC) 12h High Trend Breakout LONG
+        * Macro Bull (`h4_ema >= 0.40`): Hold=96 bars (8.0h), Chandelier Runner TP=6.00 ATR (4.0R)
 
     Strictly enforces Macro Regime Alignment:
       - Never emits LONG during TRENDING_BEAR (-1.0) or multi-week macro bear trend.
-      - Never emits SHORT during TRENDING_BULL (+1.0) or multi-day macro bull surge.
+      - Never emits SHORT during TRENDING_BULL (+1.0) or macro bull expansion (`h4_ema >= 0.30`).
     """
     m5_ret1 = X_primary[:, _PRIM_COL_IDX["m5_ret_1"]]
     ret_6h = X_primary[:, _PRIM_COL_IDX["m5_ret_72"]]
@@ -97,6 +105,7 @@ def extract_institutional_sleeve_signals(
     is_sge_win = X_primary[:, _PRIM_COL_IDX["m5_is_sge_win"]] > 0.5
     is_comex_win = X_primary[:, _PRIM_COL_IDX["m5_is_comex_win"]] > 0.5
     is_ldn_win = X_primary[:, _PRIM_COL_IDX["m5_is_ldn_close_win"]] > 0.5
+    is_pmfix_bo = X_primary[:, _PRIM_COL_IDX["m5_is_pmfix_breakout"]] > 0.5
     h4_ema = X_primary[:, _PRIM_COL_IDX["h4_ema_spread_atr"]]
     ret_5d = X_primary[:, _PRIM_COL_IDX["h4_ret_30"]]
     ret_20d = X_primary[:, _PRIM_COL_IDX["h4_ret_120"]]
@@ -107,15 +116,16 @@ def extract_institutional_sleeve_signals(
     tradable = is_bull | is_bear | is_mr
 
     not_macro_bear = (~is_bear) & (h4_ema > -0.20) & (ret_20d > -0.010) & (ret_5d > -0.012)
-    not_macro_bull = (~is_bull) & (h4_ema < 0.65) & (ret_5d < 0.016)
+    not_macro_bull = (~is_bull) & (h4_ema < 0.30) & (ret_5d < 0.016) & (ret_20d < 0.030)
 
     sge_long = tradable & is_sge_win & not_macro_bear & (ret_12h < 0.008)
     comex_long = tradable & is_comex_win & not_macro_bear & (ret_6h <= -0.0042) & (m5_ret1 > 0.0)
     comex_short = tradable & is_comex_win & not_macro_bull & (ret_6h >= 0.0042) & (m5_ret1 < 0.0)
     ldn_long = tradable & is_ldn_win & not_macro_bear & (ret_6h <= -0.0032) & (m5_ret1 > 0.0)
+    pmfix_bo_long = tradable & (~is_bear) & is_pmfix_bo & (h4_ema >= 0.40)
 
     active_side = np.where(
-        comex_long | ldn_long,
+        comex_long | ldn_long | pmfix_bo_long,
         1,
         np.where(comex_short, -1, np.where(sge_long, 1, 0)),
     ).astype(np.int64)
@@ -130,10 +140,33 @@ def extract_institutional_sleeve_signals(
     raw_sleeve = np.where(
         comex_long | comex_short,
         2,
-        np.where(ldn_long, 3, np.where(sge_long, 1, 0)),
+        np.where(pmfix_bo_long, 4, np.where(ldn_long, 3, np.where(sge_long, 1, 0))),
     ).astype(np.int64)
     sleeve_id = np.where(active_side != 0, raw_sleeve, 0).astype(np.int64)
-    hold_bars = np.where(sleeve_id == 2, 156, np.where(sleeve_id == 3, 84, 66)).astype(np.int64)
+
+    use_chandelier = (sleeve_id == 4) | ((sleeve_id == 3) & (h4_ema >= h4_trend_runner_threshold))
+    hold_bars = np.where(
+        sleeve_id == 4,
+        96,
+        np.where(
+            (sleeve_id == 3) & use_chandelier,
+            108,
+            np.where(sleeve_id == 2, 156, np.where(sleeve_id == 3, 84, 66)),
+        ),
+    ).astype(np.int64)
+    pt_atr_mults = np.where(use_chandelier, 6.00, 3.30).astype(np.float64)
+    return active_side, sleeve_id, hold_bars, pt_atr_mults, use_chandelier
+
+
+def extract_institutional_sleeve_signals(
+    X_primary: np.ndarray,
+    regime_codes: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return `(active_side, sleeve_id, hold_bars)` for institutional Market-Clock sleeves."""
+    active_side, sleeve_id, hold_bars, _, _ = extract_sleeve_barrier_schedule(
+        X_primary=X_primary,
+        regime_codes=regime_codes,
+    )
     return active_side, sleeve_id, hold_bars
 
 
@@ -301,8 +334,10 @@ class MetaLabelingTrainer:
         final_primary = self._make_primary_estimator()
         final_primary.fit(X_prim, y_prim_cls)
 
-        # Step 3: Build Secondary Meta-Labels from OOF Primary + Institutional Sleeve signals
-        _, oof_sleeves, oof_hold_bars = extract_institutional_sleeve_signals(X_prim, regime_codes)
+        # Step 3: Build Secondary Meta-Labels from OOF Primary + Institutional Sleeve & Chandelier Runner signals
+        _, oof_sleeves, oof_hold_bars, oof_pt_mults, oof_use_chand = extract_sleeve_barrier_schedule(
+            X_prim, regime_codes
+        )
         X_meta_oof, oof_sides, _ = build_meta_feature_matrix(
             X_primary=X_prim,
             primary_probs=oof_probs,
@@ -317,6 +352,8 @@ class MetaLabelingTrainer:
             max_holding_bars=self._cfg.triple_barrier_max_bars,
             point=self._spec.point,
             max_holding_bars_arr=oof_hold_bars,
+            pt_atr_mult_arr=oof_pt_mults,
+            enable_ratchet_arr=oof_use_chand,
             contract_size=self._spec.contract_size,
             enable_ratchet=False,
         )

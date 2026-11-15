@@ -290,3 +290,37 @@ def test_institutional_sleeve_signals_and_horizons():
     assert list(holds) == [66, 156, 84]
 
 
+def test_chandelier_trend_runner_barrier_schedule():
+    """Verify 4-Sleeve schedule: S1=66, S2=156, S3 Bull-Runner=108/6.0 Chandelier, S4 PMFix Breakout=96/6.0 Chandelier."""
+    from regime_ai_engine.meta_labeling_models import extract_sleeve_barrier_schedule
+
+    idx_map = {col: i for i, col in enumerate(PRIMARY_FEATURE_COLUMNS)}
+    X = np.zeros((4, len(PRIMARY_FEATURE_COLUMNS)), dtype=np.float32)
+    regimes = np.array([1.0, 0.5, 1.0, 1.0], dtype=np.float32)
+
+    # Row 0: SGE AM Fix Accumulation -> LONG (+1), Sleeve 1, Hold 66 bars, PT 3.30 ATR, Chandelier False
+    X[0, idx_map["m5_is_sge_win"]] = 1.0
+    X[0, idx_map["h4_ema_spread_atr"]] = 0.55
+
+    # Row 1: COMEX exhaustion in neutral H4 (< 0.30 gate) -> SHORT (-1), Sleeve 2, Hold 156, PT 3.30, Chandelier False
+    X[1, idx_map["m5_is_comex_win"]] = 1.0
+    X[1, idx_map["m5_ret_72"]] = 0.0060
+    X[1, idx_map["m5_ret_1"]] = -0.0005
+    X[1, idx_map["h4_ema_spread_atr"]] = 0.15
+
+    # Row 2: London-Close in strong H4 bull (>= 0.50) -> LONG (+1), Sleeve 3, Hold 108, PT 6.00, Chandelier True
+    X[2, idx_map["m5_is_ldn_close_win"]] = 1.0
+    X[2, idx_map["m5_ret_72"]] = -0.0045
+    X[2, idx_map["m5_ret_1"]] = 0.0004
+    X[2, idx_map["h4_ema_spread_atr"]] = 0.55
+
+    # Row 3: Post-LBMA PM Fix 12h Breakout in H4 bull (>= 0.40) -> LONG (+1), Sleeve 4, Hold 96, PT 6.00, Chandelier True
+    X[3, idx_map["m5_is_pmfix_breakout"]] = 1.0
+    X[3, idx_map["h4_ema_spread_atr"]] = 0.45
+
+    sides, sleeves, holds, pt_mults, use_chand = extract_sleeve_barrier_schedule(X, regimes)
+    assert list(sides) == [1, -1, 1, 1]
+    assert list(sleeves) == [1, 2, 3, 4]
+    assert list(holds) == [66, 156, 108, 96]
+    assert list(np.round(pt_mults, 2)) == [3.3, 3.3, 6.0, 6.0]
+    assert list(use_chand) == [False, False, True, True]

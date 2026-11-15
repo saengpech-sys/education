@@ -48,6 +48,7 @@ PRIMARY_FEATURE_COLUMNS: Tuple[str, ...] = (
     "m5_is_sge_win",
     "m5_is_comex_win",
     "m5_is_ldn_close_win",
+    "m5_is_pmfix_breakout",
     # M15 context features
     "m15_ret_1",
     "m15_ret_4",

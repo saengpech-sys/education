@@ -3,8 +3,8 @@
 Institutional-grade quantitative algorithmic trading architecture engineered around **Ultra-Low Equity Volatility** and **Geometric Compounding**.
 
 ## Core First Principles
-1. **Volatility Targeting & Macro-Gated Market Regime Detection**: Combines Multi-Scale Hurst Exponent (`M5` + `H1`), 24-hour Volatility Z-Score/Ratio baselines, and Structural `H4` / 20-Day Macro Trend Gating to halt execution immediately during abnormal volatility shocks or random mid-session chop, while blocking counter-trend longs during macro bear trends (`h4_ema <= -0.20`) and counter-trend shorts during macro bull trends (`h4_ema >= +0.65`).
-2. **Institutional Bullion Market-Clock Alpha + ONNX Meta-Labeling (Zero Martingale)**: Exploits structural physical/futures liquidity handoffs in `XAUUSD` across three statistically significant (`t > 2.20`) orthogonal sleeves — **Shanghai SGE Benchmark Fix Accumulation (`20:45–21:30 -> 02:30 UTC`)**, **COMEX / LBMA PM Fix 6h Exhaustion Reversal (`12:00–15:55 UTC`)**, and **London-Close Settlement Exhaustion (`16:30–19:30 -> 01:30 UTC`)** — filtered by Marcos López de Prado's **Two-Stage LightGBM -> ONNX Meta-Labeling Engine**, **Diurnally-Stabilized 24h ATR Swing Barriers**, **Dynamic Fractional-Kelly (`0.50%–1.00%` risk/trade) + Downside Semi-Volatility Targeting**, **Hard Drawdown Circuit Breakers** (`2.5%` Daily DD / `5.65%` Trailing DD `< 6.0%` -> Cooldown Halt -> `0.5x` Probation Recovery), and **Liquidity-Aware TWAP / Iceberg Slicing**.
+1. **Volatility Targeting & Macro-Gated Market Regime Detection**: Combines Multi-Scale Hurst Exponent (`M5` + `H1`), 24-hour Volatility Z-Score/Ratio baselines, and Structural `H4` / 20-Day Macro Trend Gating to halt execution immediately during abnormal volatility shocks or random mid-session chop, while blocking counter-trend longs during macro bear trends (`h4_ema <= -0.20`) and counter-trend shorts during macro bull expansions (`h4_ema >= +0.30`).
+2. **4-Sleeve Institutional Bullion Market-Clock & Breakout Alpha + Chandelier Trailing Stop + ONNX Meta-Labeling (Zero Martingale)**: Exploits structural physical/futures liquidity handoffs and trend breakouts in `XAUUSD` across four orthogonal sleeves — **Shanghai SGE Benchmark Fix Accumulation (`20:45–21:30 -> 02:30 UTC`)**, **COMEX / LBMA PM Fix 6h Exhaustion Reversal (`12:00–15:55 UTC`)**, **London-Close Settlement Exhaustion + `9h` Chandelier Bull-Runner (`16:30–19:55 UTC`)**, and **Post-LBMA PM Fix `12h` High Trend Breakout + `8h` Chandelier Trailing Stop (`15:00–16:25 UTC`)** — filtered by Marcos López de Prado's **Two-Stage LightGBM -> ONNX Meta-Labeling Engine**, **Dynamic Fractional-Kelly (`2.40%–3.50%` risk/trade) + Downside Semi-Volatility Targeting**, **Hard Drawdown Circuit Breakers** (`7.5%` Daily DD / `17.0%` Trailing DD `< 20.0%` -> Cooldown Halt -> `0.5x` Probation Recovery), and **Liquidity-Aware TWAP / Iceberg Slicing**.
 
 ## Directory Structure
 ```text
@@ -22,12 +22,12 @@ Institutional-grade quantitative algorithmic trading architecture engineered aro
 │   └── mtf_aligner.py                   # Leak-free close_time MTF aligner (M5, M15, H1, H4)
 ├── regime_ai_engine/
 │   ├── regime_detector.py               # H4 Macro + Hurst Market Regime Classifier & Shock Gate
-│   ├── triple_barrier.py                # Triple-Barrier, Sleeve Horizon Meta-Labels & Causal Simulator
-│   ├── meta_labeling_models.py          # 3-Sleeve Institutional Primary + Meta LightGBM Trainer & ONNX Exporter
+│   ├── triple_barrier.py                # Triple-Barrier, Chandelier Trailing-Stop & Causal Simulator
+│   ├── meta_labeling_models.py          # 4-Sleeve Institutional + Chandelier Primary & Meta LightGBM -> ONNX
 │   └── onnx_inference.py                # Sub-millisecond Calibrated ONNX Runtime Inference Engine
 ├── risk_and_scaling_engine/
 │   ├── position_sizer.py                # Dynamic Fractional Kelly + Vol Target + Inverse ATR/Spread Sizer
-│   ├── circuit_breaker.py               # Equity Curve Control (2.5% Daily / 5.65% Trailing DD < 6.0%)
+│   ├── circuit_breaker.py               # Equity Curve Control (7.5% Daily / 17.0% Trailing DD < 20.0%)
 │   └── liquidity_scaler.py              # Max-Lot Ceiling & TWAP / Iceberg Order Slicer
 ├── backtest_and_validation/
 │   ├── purged_cv.py                     # Purged K-Fold Cross-Validation with Embargo
@@ -38,7 +38,7 @@ Institutional-grade quantitative algorithmic trading architecture engineered aro
 │   ├── time_and_spread_filters.py       # SpreadGuard & Rollover / Weekend / News Blackout Filter
 │   ├── mt5_executor.py                  # Auto-Reconnect, Transient Retry, & TWAP Slice Executor
 │   └── audit_database.py                # SQLite (WAL) / PostgreSQL Audit & Feedback Loop
-└── tests/                               # 15 Unit & Integration Tests
+└── tests/                               # 16 Unit & Integration Tests
 ```
 
 ## Quick Start
@@ -46,7 +46,7 @@ Institutional-grade quantitative algorithmic trading architecture engineered aro
 # Install dependencies
 pip install -r requirements.txt
 
-# Run full unit & integration test suite (15 tests)
+# Run full unit & integration test suite (16 tests)
 pytest
 
 # Run end-to-end Walk-Forward + 1,000x Monte Carlo + ONNX + SQLite pipeline (30,000 M5 bars)

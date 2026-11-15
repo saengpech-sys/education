@@ -29,7 +29,7 @@ from core.contracts import (
 from data_pipeline.mtf_aligner import PRIMARY_FEATURE_COLUMNS
 from regime_ai_engine.meta_labeling_models import (
     build_meta_feature_matrix,
-    extract_institutional_sleeve_signals,
+    extract_sleeve_barrier_schedule,
 )
 from regime_ai_engine.regime_detector import MarketRegimeDetector, REGIME_TO_NUMERIC_CODE
 
@@ -127,6 +127,9 @@ class ONNXMetaLabelingEngine:
             dtype=np.float32,
         )
 
+        _, _, _, _, use_chand_snap = extract_sleeve_barrier_schedule(X_prim, regime_code)
+        eff_rr_ratio = 2.60 if bool(use_chand_snap[0]) else rr_ratio
+
         X_meta, active_sides, max_dir_probs = build_meta_feature_matrix(
             X_primary=X_prim,
             primary_probs=prim_probs,
@@ -148,7 +151,7 @@ class ONNXMetaLabelingEngine:
                 primary_probability=prim_prob,
                 meta_win_probability=0.0,
                 confidence_threshold=self._threshold,
-                reward_to_risk_ratio=rr_ratio,
+                reward_to_risk_ratio=eff_rr_ratio,
                 approved=False,
                 rejection_reason="PRIMARY_SIGNAL_FLAT",
                 inference_latency_ms=latency_ms,
@@ -179,20 +182,30 @@ class ONNXMetaLabelingEngine:
             primary_probability=prim_prob,
             meta_win_probability=meta_win_prob,
             confidence_threshold=effective_gate,
-            reward_to_risk_ratio=rr_ratio,
+            reward_to_risk_ratio=eff_rr_ratio,
             approved=approved,
             rejection_reason=rejection,
             inference_latency_ms=latency_ms,
             feature_snapshot=dict(snapshot.features),
         )
 
-    def evaluate_batch_with_sleeves(
+    def evaluate_batch_with_barriers(
         self,
         df: pd.DataFrame,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Series]:
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.Series,
+    ]:
         """
-        Batch ONNX evaluation returning sleeve IDs and sleeve-specific holding horizons:
-        `(approved_sides, sleeve_ids, hold_bars, primary_probs, meta_win_probs, regimes)`.
+        Batch ONNX evaluation returning sleeve IDs, holding horizons, TP multipliers,
+        and Chandelier Trend-Runner flags:
+        `(approved_sides, sleeve_ids, hold_bars, pt_atr_mults, use_chandelier, primary_probs, meta_win_probs, regimes)`.
         """
         regimes = self._regime_detector.classify_dataframe(df)
         tradable_mask = np.array([MarketRegime(r).is_tradable for r in regimes], dtype=bool)
@@ -209,7 +222,9 @@ class ONNXMetaLabelingEngine:
             / np.maximum(df[atr_col].to_numpy(dtype=np.float32), float(self._spec.point))
         )
 
-        _, sleeve_ids, hold_bars = extract_institutional_sleeve_signals(X_prim, regime_codes)
+        _, sleeve_ids, hold_bars, pt_atr_mults, use_chandelier = extract_sleeve_barrier_schedule(
+            X_prim, regime_codes
+        )
         X_meta, active_sides, max_dir_probs = build_meta_feature_matrix(
             X_primary=X_prim,
             primary_probs=prim_probs,
@@ -223,6 +238,35 @@ class ONNXMetaLabelingEngine:
         approved_mask = tradable_mask & (active_sides != 0) & (meta_probs >= effective_gate)
         final_sides = np.where(approved_mask, active_sides, 0).astype(np.int64)
         final_sleeves = np.where(approved_mask, sleeve_ids, 0).astype(np.int64)
+        return (
+            final_sides,
+            final_sleeves,
+            hold_bars,
+            pt_atr_mults,
+            use_chandelier,
+            max_dir_probs,
+            meta_probs,
+            regimes,
+        )
+
+    def evaluate_batch_with_sleeves(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Series]:
+        """
+        Batch ONNX evaluation returning sleeve IDs and sleeve-specific holding horizons:
+        `(approved_sides, sleeve_ids, hold_bars, primary_probs, meta_win_probs, regimes)`.
+        """
+        (
+            final_sides,
+            final_sleeves,
+            hold_bars,
+            _,
+            _,
+            max_dir_probs,
+            meta_probs,
+            regimes,
+        ) = self.evaluate_batch_with_barriers(df)
         return final_sides, final_sleeves, hold_bars, max_dir_probs, meta_probs, regimes
 
     def evaluate_batch_dataframe(

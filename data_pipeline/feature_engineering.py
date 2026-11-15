@@ -358,6 +358,10 @@ def build_single_timeframe_features(
         feat["m5_is_ldn_close_win"] = (
             no_fri_night & (((hours == 16) & (mins >= 30)) | ((hours >= 17) & (hours <= 19)))
         ).astype(float)
+        prev_hi_144 = high.shift(1).rolling(window=144, min_periods=48).max()
+        feat["m5_is_pmfix_breakout"] = (
+            no_fri_night & (hour_frac >= 15.0) & (hour_frac <= 16.42) & (close > prev_hi_144)
+        ).astype(float)
 
     if prefix == "h4":
         # Causal ~5-day (30 H4 bars) and ~20-day (120 H4 bars) macro regime return filters

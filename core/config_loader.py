@@ -142,9 +142,9 @@ class AppConfig:
 def _validate_config(cfg: AppConfig) -> None:
     """Enforce First-Principles risk & statistical invariants at startup."""
     r = cfg.risk_and_scaling
-    if not (0.0 < r.min_risk_per_trade_pct <= r.max_risk_per_trade_pct <= 0.02):
+    if not (0.0 < r.min_risk_per_trade_pct <= r.max_risk_per_trade_pct <= 0.04):
         raise ValueError(
-            "Risk per trade must satisfy 0 < min_risk <= max_risk <= 2.0% (Martingale is forbidden)."
+            "Risk per trade must satisfy 0 < min_risk <= max_risk <= 4.0% (Martingale is forbidden)."
         )
     if not (0.0 < r.kelly_fraction <= 1.0):
         raise ValueError("kelly_fraction must be within (0, 1].")

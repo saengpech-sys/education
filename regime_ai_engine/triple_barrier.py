@@ -98,14 +98,18 @@ def simulate_dynamic_barrier_trade(
     point: float = 0.01,
     slippage_price: float = 0.0,
     enable_ratchet: bool = True,
+    be_trigger_r: float = 1.70,
+    be_offset_r: float = 0.35,
+    trail_trigger_r: float = 1.95,
+    trail_atr_mult: float = 0.85,
 ) -> tuple[int, float, float, str, float]:
     """
     Simulate a single directional trade with 100% causal, pessimistic intrabar execution:
     1. On each bar `j > entry_idx`, check existing `current_sl_px` against adverse extreme FIRST.
     2. Only if SL survived bar `j`, check `tp_px` against favorable extreme.
-    3. When `enable_ratchet=True`, apply end-of-bar late-stage profit protection strictly for bar `j + 1`.
-       When `enable_ratchet=False` (Institutional Market-Clock sleeves), hold cleanly to TP, SL, or
-       session benchmark Time-Barrier (e.g. Shanghai AM Fix 02:30 UTC).
+    3. When `enable_ratchet=True`, apply end-of-bar Chandelier / Break-Even trailing stop strictly
+       starting on bar `j + 1` (zero intrabar look-ahead).
+       When `enable_ratchet=False`, hold cleanly to TP, SL, or session Time-Barrier.
 
     Returns `(exit_idx, entry_px, exit_px, exit_reason, r_multiple)`.
     """
@@ -138,19 +142,19 @@ def simulate_dynamic_barrier_trade(
                 return j, entry_px, exit_px, "TAKE_PROFIT", (exit_px - entry_px) / sl_dist
 
             if enable_ratchet:
-                # End-of-bar causal stop ratchet (applies strictly starting on bar j + 1)
+                # End-of-bar causal Chandelier / BE stop ratchet (applies strictly starting on bar j + 1)
                 if bid_high > max_fav_px:
                     max_fav_px = bid_high
                 fav_r = (max_fav_px - entry_px) / sl_dist
                 atr_j = max(float(atrs[j]), point * 5.0)
                 max_valid_sl = bid_close - 0.10 * atr_j
 
-                if fav_r >= 1.70:
-                    be_sl = min(entry_px + 0.35 * sl_dist, max_valid_sl)
+                if fav_r >= be_trigger_r:
+                    be_sl = min(entry_px + be_offset_r * sl_dist, max_valid_sl)
                     if be_sl > current_sl_px:
                         current_sl_px = be_sl
-                if fav_r >= 1.95:
-                    trail_sl = min(max_fav_px - 0.85 * atr_j, max_valid_sl)
+                if fav_r >= trail_trigger_r:
+                    trail_sl = min(max_fav_px - trail_atr_mult * atr_j, max_valid_sl)
                     if trail_sl > current_sl_px:
                         current_sl_px = trail_sl
 
@@ -180,19 +184,19 @@ def simulate_dynamic_barrier_trade(
             return j, entry_px, exit_px, "TAKE_PROFIT", (entry_px - exit_px) / sl_dist
 
         if enable_ratchet:
-            # End-of-bar causal stop ratchet (applies strictly starting on bar j + 1)
+            # End-of-bar causal Chandelier / BE stop ratchet (applies strictly starting on bar j + 1)
             if ask_low < min_fav_px:
                 min_fav_px = ask_low
             fav_r = (entry_px - min_fav_px) / sl_dist
             atr_j = max(float(atrs[j]), point * 5.0)
             min_valid_sl = ask_close + 0.10 * atr_j
 
-            if fav_r >= 1.70:
-                be_sl = max(entry_px - 0.35 * sl_dist, min_valid_sl)
+            if fav_r >= be_trigger_r:
+                be_sl = max(entry_px - be_offset_r * sl_dist, min_valid_sl)
                 if be_sl < current_sl_px:
                     current_sl_px = be_sl
-            if fav_r >= 1.95:
-                trail_sl = max(min_fav_px + 0.85 * atr_j, min_valid_sl)
+            if fav_r >= trail_trigger_r:
+                trail_sl = max(min_fav_px + trail_atr_mult * atr_j, min_valid_sl)
                 if trail_sl < current_sl_px:
                     current_sl_px = trail_sl
 
@@ -210,14 +214,20 @@ def compute_meta_labels_for_sides(
     point: float = 0.01,
     slippage_points: float = 2.0,
     max_holding_bars_arr: np.ndarray | None = None,
+    pt_atr_mult_arr: np.ndarray | None = None,
+    enable_ratchet_arr: np.ndarray | None = None,
     commission_per_lot_usd: float = 3.50,
     contract_size: float = 100.0,
     enable_ratchet: bool = False,
+    be_trigger_r: float = 1.55,
+    be_offset_r: float = 0.25,
+    trail_trigger_r: float = 1.95,
+    trail_atr_mult: float = 1.50,
 ) -> pd.DataFrame:
     """
     Given Primary directional candidate predictions `predicted_sides` in {-1, 0, +1},
-    evaluate asymmetric Triple-Barrier + sleeve-specific session horizon outcome including
-    realistic bid-ask spread, slippage, and round-turn broker commission.
+    evaluate asymmetric Triple-Barrier + sleeve-specific session / Chandelier Trend-Runner outcome
+    including realistic bid-ask spread, slippage, and round-turn broker commission.
 
     Returns binary `meta_label` in {0, 1} (1 iff trade achieves net positive R > 0 after commission)
     and realized net `r_multiple`.
@@ -242,6 +252,8 @@ def compute_meta_labels_for_sides(
             continue
 
         hold_i = int(max_holding_bars_arr[i]) if max_holding_bars_arr is not None else max_holding_bars
+        pt_i = float(pt_atr_mult_arr[i]) if pt_atr_mult_arr is not None else pt_atr_mult
+        ratchet_i = bool(enable_ratchet_arr[i]) if enable_ratchet_arr is not None else enable_ratchet
         end_j, _, _, _, outcome_r = simulate_dynamic_barrier_trade(
             entry_idx=i,
             side=side,
@@ -251,11 +263,15 @@ def compute_meta_labels_for_sides(
             atrs=atrs,
             spreads_price=spreads,
             sl_atr_mult=sl_atr_mult,
-            pt_atr_mult=pt_atr_mult,
+            pt_atr_mult=pt_i,
             max_holding_bars=hold_i,
             point=point,
             slippage_price=slip_px,
-            enable_ratchet=enable_ratchet,
+            enable_ratchet=ratchet_i,
+            be_trigger_r=be_trigger_r,
+            be_offset_r=be_offset_r,
+            trail_trigger_r=trail_trigger_r,
+            trail_atr_mult=trail_atr_mult,
         )
         comm_r = commission_per_lot_usd / max(sl_atr_mult * float(atrs[i]) * contract_size, 1e-6)
         net_r = float(outcome_r) - comm_r
